@@ -1,0 +1,17 @@
+# Personal data and runtime output (never commit)
+data/*
+!data/.gitkeep
+backups/
+logs/
+reports/
+.env
+*.db
+*.db-wal
+*.db-shm
+STOP
+
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
