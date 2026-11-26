@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS batches (
     approved_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS batch_sites (
+    batch_id    TEXT NOT NULL REFERENCES batches(batch_id),
+    position    INTEGER NOT NULL,
+    site_key    TEXT NOT NULL,
+    domain      TEXT NOT NULL,
+    input_url   TEXT NOT NULL,
+    source_file TEXT,
+    source_row  INTEGER,
+    PRIMARY KEY (batch_id, site_key)
+);
+CREATE INDEX IF NOT EXISTS batch_sites_site_key ON batch_sites(site_key);
+
 CREATE TABLE IF NOT EXISTS sites (
     site_key        TEXT PRIMARY KEY,
     domain          TEXT NOT NULL,
@@ -258,9 +270,82 @@ class Ledger:
         ).fetchone()
         return row is not None
 
+    # -- batches ----------------------------------------------------------
+    def is_planned(self, site_key: str) -> bool:
+        """True if the site is already part of any batch."""
+        row = self._conn.execute("SELECT 1 FROM batch_sites WHERE site_key = ? LIMIT 1", (site_key,)).fetchone()
+        return row is not None
+
+    def create_batches(self, groups: list[list[dict[str, Any]]], source_file: str | None = None) -> list[str]:
+        """Store each group as a new batch in state `planned`. Returns the new batch ids (B0001, B0002, ...).
+
+        Each item needs site_key, domain, input_url and optionally source_row.
+        One transaction: either every batch is stored or none is.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT MAX(CAST(SUBSTR(batch_id, 2) AS INTEGER)) FROM batches WHERE batch_id GLOB 'B[0-9]*'"
+            ).fetchone()
+            next_n = (row[0] or 0) + 1
+            ids: list[str] = []
+            now = _now()
+            for group in groups:
+                if not group:
+                    continue
+                batch_id = f"B{next_n:04d}"
+                next_n += 1
+                conn.execute("INSERT INTO batches (batch_id, created_at, size, state) VALUES (?, ?, ?, 'planned')",
+                             (batch_id, now, len(group)))
+                conn.executemany(
+                    "INSERT INTO batch_sites (batch_id, position, site_key, domain, input_url, source_file, source_row) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(batch_id, i, it["site_key"], it["domain"], it["input_url"], source_file, it.get("source_row"))
+                     for i, it in enumerate(group, 1)],
+                )
+                ids.append(batch_id)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return ids
+
+    def list_batches(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._conn.execute("SELECT * FROM batches ORDER BY batch_id").fetchall()]
+
+    def batch_sites(self, batch_id: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT * FROM batch_sites WHERE batch_id = ? ORDER BY position", (batch_id,)).fetchall()]
+
     # -- events -----------------------------------------------------------
     def add_event(self, level: str, message: str, site_key: str | None = None) -> None:
         self._conn.execute(
             "INSERT INTO events (ts, site_key, level, message) VALUES (?, ?, ?, ?)",
             (_now(), site_key, level, message),
         )
+
+
+def open_readonly(path: str | Path) -> sqlite3.Connection:
+    """Read-only connection (SQLite URI mode=ro). Never creates or modifies the file."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"ledger {p} does not exist")
+    conn = sqlite3.connect(f"{p.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def status_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Counts for `python -m outreach status`, from any (read-only) connection."""
+    by_status = {s: 0 for s in STATUSES}
+    for r in conn.execute("SELECT status, COUNT(*) FROM sites GROUP BY status"):
+        by_status[r[0]] = r[1]
+    batches = [dict(r) for r in conn.execute(
+        "SELECT b.batch_id, b.state, b.size, b.created_at, b.approved_at FROM batches b ORDER BY b.batch_id")]
+    suppression = {k: 0 for k in SUPPRESSION_KINDS}
+    for r in conn.execute("SELECT kind, COUNT(*) FROM suppression GROUP BY kind"):
+        suppression[r[0]] = r[1]
+    return {"sites": by_status, "batches": batches, "suppression": suppression,
+            "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]}

@@ -39,7 +39,15 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 1
+LATEST_IMPLEMENTED_STEP = 2
+
+# CLI commands that must exist (and no others) after each step (A8).
+EXPECTED_COMMANDS: dict[int, list[str]] = {
+    2: ["ingest", "status", "backup", "suppress"],
+    3: ["ingest", "status", "backup", "suppress"],
+    4: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export"],
+    5: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen"],
+}
 
 # --- reference data -------------------------------------------------------
 
@@ -364,7 +372,65 @@ def check_a6(step: int, state: dict) -> Result:
     return Result("A6", "FAIL" if flags else "PASS", ev)
 
 
-ALWAYS: list[Callable[[int, dict], Result]] = [check_a1, check_a2, check_a3, check_a4, check_a5, check_a6]
+def _csv_fingerprints() -> dict[str, tuple[str, int, int]]:
+    import hashlib
+    out = {}
+    for p in sorted((TESTS / "fixtures").rglob("*.csv")):
+        st = p.stat()
+        out[_rel(p)] = (hashlib.sha256(p.read_bytes()).hexdigest(), st.st_size, st.st_mtime_ns)
+    return out
+
+
+def check_a7(step: int, state: dict) -> Result | None:
+    if step < 2:
+        return None
+    before_tests = state.get("csv_before_tests", {})
+    after_tests = _csv_fingerprints()
+    ev = [f"fixture CSVs: {list(after_tests) or 'none'}"]
+    ok = bool(after_tests) and before_tests == after_tests
+    ev.append(f"sha256+size+mtime identical before and after the full pytest run (A1): {before_tests == after_tests}")
+    # Run the real CLI against the fixture file itself (not a copy), from a throw-away project root.
+    sample = TESTS / "fixtures" / "sample_sites.csv"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "templates").mkdir()
+        shutil.copyfile(ROOT / "templates" / "consent_request_v1.txt", root / "templates" / "consent_request_v1.txt")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("OUTREACH_", "SENDER_")) and k not in ("OFFSITE_BACKUP_DIR", "ALLOW_LIVE")}
+        env.update(PYTHONPATH=str(SRC), PYTHONIOENCODING="utf-8")
+        before = _csv_fingerprints()
+        codes = []
+        for args in (["ingest", str(sample)], ["ingest", str(sample)], ["status"]):
+            proc = subprocess.run([sys.executable, "-m", "outreach", *args], cwd=root, env=env, capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=120)
+            codes.append(proc.returncode)
+        after = _csv_fingerprints()
+    ev.append(f"CLI ingest x2 + status on {_rel(sample)} from a temp project: exit codes {codes}; "
+              f"CSV unchanged: {before == after}")
+    ok = ok and before == after and codes == [0, 0, 0]
+    return Result("A7", "PASS" if ok else "FAIL", ev)
+
+
+def check_a8(step: int, state: dict) -> Result | None:
+    if step < 2:
+        return None
+    env = dict(os.environ, PYTHONPATH=str(SRC), PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, "-m", "outreach", "--help"], cwd=ROOT, env=env, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=60)
+    found = re.findall(r"^\s{4}([a-z][a-z-]*)\s{2,}\S", proc.stdout, re.M)
+    expected = EXPECTED_COMMANDS.get(step, EXPECTED_COMMANDS[max(k for k in EXPECTED_COMMANDS if k <= step)])
+    ok = proc.returncode == 0 and sorted(found) == sorted(expected)
+    ev = [f"`python -m outreach --help` exit code {proc.returncode}",
+          f"commands listed: {found}",
+          f"expected after Prompt {step}: {expected}"]
+    extra = sorted(set(found) - set(expected))
+    if extra:
+        ev.append(f"commands from a later prompt: {extra}")
+    return Result("A8", "PASS" if ok else "FAIL", ev)
+
+
+ALWAYS: list[Callable[[int, dict], Result | None]] = [check_a1, check_a2, check_a3, check_a4, check_a5, check_a6,
+                                                      check_a7, check_a8]
 
 
 # --- After Prompt 0 -------------------------------------------------------
@@ -731,14 +797,177 @@ def p1_mutations(step: int, state: dict) -> Result:
     return Result("P1.7", "PASS" if ok else "FAIL", ev)
 
 
+# --- After Prompt 2 -------------------------------------------------------
+
+def _required(state: dict, names: dict[str, str]) -> tuple[bool, list[str]]:
+    """Check that each named test (exact id, or prefix ending in '[' for all params) passed."""
+    junit = state.get("junit", {})
+    ok, ev = True, []
+    for label, name in names.items():
+        if name.endswith("["):
+            hits = {k: v for k, v in junit.items() if k.startswith(name)}
+            good = bool(hits) and all(v == "passed" for v in hits.values())
+            ev.append(f"{label}: {name}*] -> {len(hits)} case(s), all passed: {good}")
+        else:
+            good = junit.get(name) == "passed"
+            ev.append(f"{label}: {name} -> {junit.get(name, 'MISSING')}")
+        ok &= good
+    return ok, ev
+
+
+def _lines_matching(path: Path, pattern: str) -> list[str]:
+    return [f"{_rel(path)}:{i}: {l.strip()}" for i, l in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1)
+            if re.search(pattern, l)]
+
+
+def p2_settings_documented(step: int, state: dict) -> Result:
+    with tempfile.TemporaryDirectory() as td:
+        proc = _run_project_code(f"""
+            from outreach.config import SETTINGS, load_config
+            c = load_config(root={td!r}, environ={{}}, use_dotenv=False)
+            print("ADDRESS=" + c.sender_address)
+            for s in SETTINGS: print("ENV=" + s.env)
+            """)
+    envs = re.findall(r"^ENV=(\S+)", proc.stdout, re.M)
+    address = re.search(r"^ADDRESS=(.*)$", proc.stdout, re.M)
+    readme = (ROOT / "README.md").read_text(encoding="utf-8-sig")
+    missing = [e for e in envs if f"`{e}`" not in readme]
+    ev = [f"settings in config.SETTINGS: {envs}",
+          f"documented in README.md: {len(envs) - len(missing)}/{len(envs)}" + (f"; missing {missing}" if missing else ""),
+          f"sender address default: {address.group(1) if address else '?'!r}"]
+    ok = proc.returncode == 0 and envs and not missing and address and address.group(1) == "TODO"
+    return Result("P2.1", "PASS" if ok else "FAIL", ev)
+
+
+def p2_backup(step: int, state: dict) -> Result:
+    bk = SRC / "outreach" / "backup.py"
+    api = _lines_matching(bk, r"\.backup\(")
+    raw = []
+    for p in _py_files(SRC):
+        raw += _lines_matching(p, r"\bshutil\b|copyfile|copy2|\.read_bytes\(|\.write_bytes\(|open\([^)]*['\"]wb")
+    ok, ev = _required(state, {
+        "backup opens + integrity ok": "tests/test_backup.py::test_backup_is_valid_openable_database",
+        "WAL content included": "tests/test_backup.py::test_backup_includes_uncheckpointed_wal_content",
+        "newest 30 kept": "tests/test_backup.py::test_backup_keeps_only_newest_30",
+        "offsite copy works": "tests/test_backup.py::test_offsite_copy_is_written_and_valid",
+        "offsite missing folder raises": "tests/test_backup.py::test_offsite_missing_folder_fails_loudly",
+        "offsite copy error raises": "tests/test_backup.py::test_offsite_copy_error_fails_loudly",
+        "only the backup API is used": "tests/test_backup.py::test_backup_uses_sqlite_backup_api",
+    })
+    ev = [f"backup API call: {a}" for a in api] + [f"raw file copy in src/: {raw or 'none'}"] + ev
+    return Result("P2.2", "PASS" if ok and api and not raw else "FAIL", ev)
+
+
+def p2_sendlog(step: int, state: dict) -> Result:
+    sl = SRC / "outreach" / "sendlog.py"
+    fsync = _lines_matching(sl, r"os\.fsync\(")
+    flush = _lines_matching(sl, r"\.flush\(\)")
+    opens = _lines_matching(sl, r"\bopen\(")
+    append_only = opens and all(re.search(r"open\([^)]*[\"']a[\"']", o) for o in opens)
+    ok, ev = _required(state, {
+        "one JSON line per event": "tests/test_sendlog.py::test_append_writes_one_json_line_per_event",
+        "each append flushed + fsynced": "tests/test_sendlog.py::test_each_append_is_flushed_and_fsynced",
+        "never truncates": "tests/test_sendlog.py::test_append_only_never_truncates",
+    })
+    ev = fsync + flush + [f"open() calls: {opens}; all append mode: {bool(append_only)}"] + ev
+    return Result("P2.3", "PASS" if ok and fsync and flush and append_only else "FAIL", ev)
+
+
+def p2_preflight(step: int, state: dict) -> Result:
+    pf = SRC / "outreach" / "preflight.py"
+    order: list[str] = []
+    for m in re.finditer(r'Check\("([a-z_]+)"', pf.read_text(encoding="utf-8-sig")):
+        if m.group(1) not in order:
+            order.append(m.group(1))
+    expected = ["stop_file", "ledger_integrity", "ledger_missing", "template", "sender_details"]
+    integrity = _lines_matching(pf, r"PRAGMA integrity_check")
+    live_only = _lines_matching(pf, r"if live:")
+    ok, ev = _required(state, {
+        "order test": "tests/test_preflight.py::test_checks_run_in_required_order",
+        "all failures in order": "tests/test_preflight.py::test_all_failures_reported_in_order",
+        "REFUSES: ledger missing + backup": "tests/test_preflight.py::test_refuses_when_ledger_missing_but_backup_exists",
+        "REFUSES: ledger missing + offsite backup":
+            "tests/test_preflight.py::test_refuses_when_ledger_missing_but_offsite_backup_exists",
+        "REFUSES: ledger missing + send log": "tests/test_preflight.py::test_refuses_when_ledger_missing_but_send_log_exists",
+        "integrity: not SQLite": "tests/test_preflight.py::test_corrupt_ledger_fails_integrity",
+        "integrity: damaged pages": "tests/test_preflight.py::test_damaged_ledger_pages_fail_integrity",
+        "TODO rejected in live mode only": "tests/test_preflight.py::test_todo_sender_rejected_in_live_mode_only",
+        "CLI ingest refused when ledger missing": "tests/test_cli.py::test_ingest_refused_when_ledger_missing_but_backup_exists",
+    })
+    ev = [f"check order in {_rel(pf)}: {order}", f"expected: {expected}"] + integrity + live_only + ev
+    return Result("P2.4", "PASS" if ok and order == expected and integrity and live_only else "FAIL", ev)
+
+
+def p2_breaker(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "N-1 not tripped, N tripped": "tests/test_breaker.py::test_trips_exactly_at_threshold[",
+        "success resets": "tests/test_breaker.py::test_success_resets_the_consecutive_count",
+    })
+    txt = (TESTS / "test_breaker.py").read_text(encoding="utf-8-sig")
+    asserts_n_minus_1 = "range(n - 1)" in txt and "n - 1" in txt
+    ev.append(f"test asserts the N-1 state explicitly: {asserts_n_minus_1}")
+    return Result("P2.5", "PASS" if ok and asserts_n_minus_1 else "FAIL", ev)
+
+
+def p2_template(step: int, state: dict) -> Result:
+    doc = BUILD_PROMPTS.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    marker = "filled from config at send time:\n\n"
+    start = doc.index(marker) + len(marker)
+    expected = doc[start:doc.index("\n\n   Add a short note", start)]
+    path = ROOT / "templates" / "consent_request_v1.txt"
+    raw = path.read_bytes() if path.exists() else b""
+    actual = raw.decode("utf-8", "replace")
+    same = actual == expected
+    diff = next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
+    note_files = [p for p in (ROOT / "docs").glob("*.md") if p.name not in ("build-prompts.md", "validation.md")
+                  and "pending legal review" in p.read_text(encoding="utf-8-sig").lower()]
+    has_bom, cr_bytes = raw.startswith(b"\xef\xbb\xbf"), raw.count(b"\r")
+    ev = [f"{_rel(path)}: {len(actual)} chars, {len(actual.splitlines())} lines; Prompt 2 text: {len(expected)} chars",
+          f"character-for-character identical: {same}" + ("" if same else f" (first difference at char {diff})"),
+          f"BOM: {has_bom}; CR bytes: {cr_bytes}",
+          f"docs note saying 'pending legal review': {[_rel(p) for p in note_files] or 'none'}"]
+    return Result("P2.6", "PASS" if same and note_files else "FAIL", ev)
+
+
+def p2_ingest(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "drops invalid/dupes/handled/suppressed, batches planned": "tests/test_ingest.py::test_ingest_sample_counts_and_batches",
+        "never claims": "tests/test_ingest.py::test_ingest_never_claims_anything",
+        "CSV byte-identical": "tests/test_ingest.py::test_ingest_leaves_csv_byte_identical",
+        "CSV opened 'rb' only": "tests/test_ingest.py::test_read_csv_opens_read_only",
+        "second ingest plans nothing new": "tests/test_ingest.py::test_second_ingest_plans_nothing_new",
+        "ambiguous column -> error listing columns": "tests/test_ingest.py::test_ambiguous_column_lists_columns",
+        "CLI ingest + status": "tests/test_cli.py::test_ingest_then_status",
+        "CLI suppress add": "tests/test_cli.py::test_suppress_add_then_ingest_skips_it",
+        "CLI backup": "tests/test_cli.py::test_backup_command",
+    })
+    opens = _lines_matching(SRC / "outreach" / "ingest.py", r"\bopen\(")
+    ev.append(f"open() calls in src/outreach/ingest.py (the CSV reader): {opens}")
+    ok &= bool(opens) and all(re.search(r"open\([^)]*\"rb\"", o) for o in opens)
+    return Result("P2.7", "PASS" if ok else "FAIL", ev)
+
+
+def p2_no_fetch(step: int, state: dict) -> Result:
+    hits = []
+    pat = (r"^\s*(import|from)\s+(httpx|requests|urllib\.request|urllib3|http\.client|socket|aiohttp|bs4|lxml|"
+           r"playwright|selenium)\b|\.post\(|\"POST\"|'POST'|<form|robotparser|robots\.txt")
+    for p in _py_files(SRC):
+        hits += _lines_matching(p, pat)
+    ev = hits or ["no network client, HTML parser, form or robots code in src/"]
+    return Result("P2.8", "FAIL" if hits else "PASS", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
         p1_required_tests, p1_mutations],
+    2: [p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
+        p2_no_fetch],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
-              p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations}
+              p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations,
+              p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest}
 
 
 # --- driver ---------------------------------------------------------------
@@ -767,8 +996,8 @@ def main() -> int:
     if step not in STEPS:
         print(f"step {step} has no checks implemented yet (latest: {LATEST_IMPLEMENTED_STEP})")
         return 2
-    state: dict = {}
-    results = [c(step, state) for c in ALWAYS]
+    state: dict = {"csv_before_tests": _csv_fingerprints()}
+    results = [r for r in (c(step, state) for c in ALWAYS) if r is not None]
     if args.all:
         for s in sorted(STEPS):
             results += [c(step, state) for c in STEPS[s] if s == step or c in PERSISTENT]

@@ -8,7 +8,10 @@ RealNetworkBlocked before a packet is sent or a DNS query is made.
 from __future__ import annotations
 
 import ipaddress
+import os
+import shutil
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -61,3 +64,25 @@ def _block_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket.socket, "connect", _connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
     monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+
+
+REPO = Path(__file__).resolve().parent.parent
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _clean_outreach_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may inherit settings or ALLOW_LIVE from the developer's shell."""
+    for name in list(os.environ):
+        if name.startswith(("OUTREACH_", "SENDER_")) or name in ("OFFSITE_BACKUP_DIR", "ALLOW_LIVE"):
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throw-away project root (cwd) containing the real message template."""
+    root = tmp_path / "project"
+    (root / "templates").mkdir(parents=True)
+    shutil.copyfile(REPO / "templates" / "consent_request_v1.txt", root / "templates" / "consent_request_v1.txt")
+    monkeypatch.chdir(root)
+    return root
