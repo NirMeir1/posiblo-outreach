@@ -52,6 +52,33 @@ def test_backup_includes_uncheckpointed_wal_content(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_raw_copy_of_ledger_file_can_lose_claims_but_backup_does_not(tmp_path: Path) -> None:
+    """Why backups use the sqlite3 API: a plain copy of ledger.db misses commits still in ledger.db-wal."""
+    import shutil
+    cfg = _config(tmp_path)
+    led = Ledger(cfg.ledger_path)
+    try:
+        led._conn.execute("PRAGMA wal_autocheckpoint = 0")  # keep the commit in the -wal file
+        led.claim("wal-only.co.il", domain="wal-only.co.il", input_url="x")
+        raw = tmp_path / "raw-copy.db"
+        shutil.copyfile(cfg.ledger_path, raw)               # what a manual copy of ledger.db does
+        api = create_backup(cfg).local
+    finally:
+        led.close()
+    conn = sqlite3.connect(raw)
+    try:
+        try:
+            found = conn.execute("SELECT COUNT(*) FROM sites WHERE site_key='wal-only.co.il'").fetchone()[0]
+        except sqlite3.OperationalError:  # even the table definitions were still only in the -wal file
+            found = 0
+        assert found == 0
+    finally:
+        conn.close()
+    conn = sqlite3.connect(api)
+    assert conn.execute("SELECT COUNT(*) FROM sites WHERE site_key='wal-only.co.il'").fetchone()[0] == 1
+    conn.close()
+
+
 def test_backup_keeps_only_newest_30(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     _seed(cfg)

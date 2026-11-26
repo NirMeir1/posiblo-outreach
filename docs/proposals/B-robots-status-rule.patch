@@ -1,0 +1,145 @@
+diff --git a/src/outreach/fetch.py b/src/outreach/fetch.py
+index a833378..931938c 100644
+--- a/src/outreach/fetch.py
++++ b/src/outreach/fetch.py
+@@ -3,8 +3,8 @@
+ - Honest User-Agent (USER_AGENT).
+ - robots.txt fetched once per host (scheme + host + port) and cached; a
+   disallowed URL is never requested and yields `robots_blocked`.
+-  robots.txt answering 401/403 or 5xx, or not reachable, is treated as
+-  "disallow everything" (conservative). 404 and other 4xx mean "allow".
++  Only a network error or a 5xx answer for robots.txt means "disallow
++  everything"; any 4xx (404 missing, 401/403, 429, ...) means "allowed".
+ - Minimum delay between two requests to the same host (from config).
+ - Sequential: one request at a time per Fetcher (a lock), no concurrency.
+ - 15 s timeout, body capped at 2 MB (declared or streamed), at most 3
+@@ -217,20 +217,26 @@ class Fetcher:
+                 self._sleep(wait)
+         self._last_request[host] = self._clock()
+ 
+-    def _request(self, url: str) -> _Raw:
+-        """Exactly one GET attempt. Raises _RequestFailed on any error."""
++    def _request(self, url: str, truncate: bool = False) -> _Raw:
++        """Exactly one GET attempt. Raises _RequestFailed on any error.
++
++        A body over the cap raises, or with truncate=True is cut at the cap (used for robots.txt).
++        """
+         self._wait_for_host(url)
+         self.requested.append(url)
+         try:
+             with self._client.stream("GET", url) as resp:
+                 declared = resp.headers.get("content-length")
+-                if declared and declared.isdigit() and int(declared) > self.max_bytes:
++                if declared and declared.isdigit() and int(declared) > self.max_bytes and not truncate:
+                     raise _RequestFailed(f"response too large: {declared} bytes declared (cap {self.max_bytes})")
+                 chunks, total = [], 0
+                 for chunk in resp.iter_bytes():
+                     total += len(chunk)
+                     if total > self.max_bytes:
+-                        raise _RequestFailed(f"response too large: more than {self.max_bytes} bytes")
++                        if not truncate:
++                            raise _RequestFailed(f"response too large: more than {self.max_bytes} bytes")
++                        chunks.append(chunk[: len(chunk) - (total - self.max_bytes)])
++                        break
+                     chunks.append(chunk)
+                 return _Raw(resp.status_code, resp.headers, b"".join(chunks))
+         except httpx.TimeoutException:
+@@ -247,27 +253,31 @@ class Fetcher:
+         return policy
+ 
+     def _fetch_robots(self, host_key: str) -> _RobotsPolicy:
++        """robots.txt policy for one host (RFC 9309).
++
++        Only a network error (unreachable, timeout) or a 5xx answer means "disallow everything".
++        Any 4xx answer (404/410 missing, 401/403, 429, ...) means "no rules": allowed.
++        Redirects are followed up to max_redirects hops, also to another host (only robots.txt is
++        read there); more hops than that is treated as "no robots.txt" (allowed). A body larger
++        than the cap is parsed up to the cap.
++        """
+         current = f"{host_key}/robots.txt"
+-        origin = registrable_domain(urlsplit(current).hostname or "")
+         for _ in range(self.max_redirects + 1):
++            if urlsplit(current).scheme not in ("http", "https"):
++                return _RobotsPolicy(allow_all=True, detail=f"robots.txt redirects to a non-http URL: {current}")
+             try:
+-                raw = self._request(current)
++                raw = self._request(current, truncate=True)
+             except _RequestFailed as e:
+                 return _RobotsPolicy(disallow_all=True, detail=f"robots.txt not reachable: {e}")
+             if raw.status in _REDIRECT_CODES and raw.headers.get("location"):
+-                nxt = urljoin(current, raw.headers["location"])
+-                if registrable_domain(urlsplit(nxt).hostname or "") != origin:
+-                    return _RobotsPolicy(disallow_all=True, detail="robots.txt redirects to another domain")
+-                current = nxt
++                current = urljoin(current, raw.headers["location"])
+                 continue
+-            if raw.status in (401, 403):
+-                return _RobotsPolicy(disallow_all=True, detail=f"robots.txt answered HTTP {raw.status}")
+-            if 400 <= raw.status < 500:
+-                return _RobotsPolicy(allow_all=True)
+             if raw.status >= 500:
+                 return _RobotsPolicy(disallow_all=True, detail=f"robots.txt answered HTTP {raw.status}")
++            if 400 <= raw.status < 500:
++                return _RobotsPolicy(allow_all=True, detail=f"robots.txt answered HTTP {raw.status}: no rules")
+             parser = robotparser.RobotFileParser()
+             parser.parse(raw.body.decode("utf-8", errors="replace").splitlines())
+             parser.modified()  # can_fetch() answers False until the parser is marked as checked
+             return _RobotsPolicy(parser=parser)
+-        return _RobotsPolicy(disallow_all=True, detail="robots.txt: too many redirects")
++        return _RobotsPolicy(allow_all=True, detail="robots.txt: too many redirects, treated as missing")
+diff --git a/tests/test_fetch.py b/tests/test_fetch.py
+index 5f69c64..258b758 100644
+--- a/tests/test_fetch.py
++++ b/tests/test_fetch.py
+@@ -69,8 +69,8 @@ def test_robots_fetched_once_per_host(httpserver: HTTPServer, fetcher: Fetcher)
+     assert paths(httpserver).count("/robots.txt") == 1
+ 
+ 
+-@pytest.mark.parametrize(("status", "allowed"), [(404, True), (410, True), (401, False), (403, False),
+-                                                 (500, False), (503, False)])
++@pytest.mark.parametrize(("status", "allowed"), [(404, True), (410, True), (401, True), (403, True), (429, True),
++                                                 (500, False), (502, False), (503, False)])
+ def test_robots_status_handling(httpserver: HTTPServer, fetcher: Fetcher, status: int, allowed: bool) -> None:
+     robots(httpserver, "", status=status)
+     httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
+@@ -233,7 +233,7 @@ def test_robots_404_means_allow_and_page_is_fetched(httpserver: HTTPServer, fetc
+ 
+ @pytest.mark.parametrize("status", [429])
+ def test_robots_429_is_currently_treated_as_allow(httpserver: HTTPServer, fetcher: Fetcher, status: int) -> None:
+-    """Documents current behaviour (4xx other than 401/403 = allow). See docs/audit.md for the proposal."""
++    """Any 4xx means "no rules": allowed (only network errors and 5xx disallow)."""
+     robots(httpserver, "", status=status)
+     httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
+     assert fetcher.get(httpserver.url_for("/")).outcome == OK
+@@ -285,3 +285,30 @@ def test_finder_extra_fetch_limit_on_live_server(httpserver: HTTPServer, fetcher
+     assert r.status == "no_form"
+     pages = [p for p in paths(httpserver) if p != "/robots.txt"]
+     assert len(pages) == 4  # homepage + at most 3 extra
++
++
++def test_robots_redirect_to_another_host_is_followed(httpserver: HTTPServer, fetcher: Fetcher) -> None:
++    other = httpserver.url_for("/robots-elsewhere.txt").replace("127.0.0.1", "localhost")
++    httpserver.expect_request("/robots.txt").respond_with_data("", status=301, headers={"Location": other})
++    httpserver.expect_request("/robots-elsewhere.txt").respond_with_data("User-agent: *\nDisallow: /private\n")
++    httpserver.expect_request("/public").respond_with_data("ok", content_type="text/html")
++    assert fetcher.get(httpserver.url_for("/private")).outcome == ROBOTS_BLOCKED   # the target's rules apply
++    assert fetcher.get(httpserver.url_for("/public")).outcome == OK
++
++
++def test_robots_too_many_redirects_is_treated_as_missing(httpserver: HTTPServer, fetcher: Fetcher) -> None:
++    chain = ["/robots.txt", "/r1", "/r2", "/r3", "/r4"]
++    for a, b in zip(chain, chain[1:]):
++        httpserver.expect_request(a).respond_with_data("", status=302, headers={"Location": b})
++    httpserver.expect_request("/page").respond_with_data("ok", content_type="text/html")
++    r = fetcher.get(httpserver.url_for("/page"))
++    assert r.outcome == OK
++    assert "/r4" not in paths(httpserver)
++
++
++def test_oversized_robots_is_parsed_up_to_the_cap(httpserver: HTTPServer, fetcher: Fetcher) -> None:
++    body = "User-agent: *\nDisallow: /private\n" + "# padding\n" * (MAX_BODY_BYTES // 10 + 10)
++    httpserver.expect_request("/robots.txt").respond_with_data(body, content_type="text/plain")
++    httpserver.expect_request("/public").respond_with_data("ok", content_type="text/html")
++    assert fetcher.get(httpserver.url_for("/private")).outcome == ROBOTS_BLOCKED
++    assert fetcher.get(httpserver.url_for("/public")).outcome == OK
+\ No newline at end of file

@@ -202,6 +202,50 @@ send.run_send(cfg, Ledger(cfg.ledger_path), "B0001", environ={{"ALLOW_LIVE": "1"
     assert sites.posts() == []
 
 
+def test_two_terminals_sending_the_same_batch_at_once(two) -> None:
+    """Two concurrent `send` runs (separate ledger connections, started together): one POST per site."""
+    import threading
+    cfg, led, sites = two
+    barrier = threading.Barrier(2)
+    reports, errors = [], []
+
+    def run() -> None:
+        try:
+            with Ledger(cfg.ledger_path) as mine, Fetcher(delay_seconds=0) as f:
+                barrier.wait(timeout=30)
+                reports.append(run_send(cfg, mine, "B0001", environ=LIVE, fetcher=f, out=lambda s: None))
+        except BaseException as e:  # surface thread failures
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+    assert len(sites.posts("a")) == 1 and len(sites.posts("b")) == 1
+    posted = [s.site_key for r in reports for s in r.sites if s.posted]
+    assert sorted(posted) == [key("a"), key("b")]
+    assert led.get(key("a"))["status"] == SENT and led.get(key("b"))["status"] == SENT
+
+
+def test_send_refused_when_ledger_missing_but_send_log_exists(two) -> None:
+    cfg, led, sites = two
+    run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    led.close()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(cfg.ledger_path) + suffix).unlink(missing_ok=True)
+    for p in cfg.backup_dir.glob("*.db"):
+        p.unlink()                                   # even with no backups left, the send log blocks it
+    sites.server.clear_log()
+    fresh = Ledger(cfg.ledger_path.with_name("elsewhere.db"))   # any ledger object; preflight checks the real path
+    with pytest.raises(SendRefused, match="MISSING"):
+        run_send(cfg, fresh, "B0001", environ=LIVE, **quiet())
+    fresh.close()
+    assert httpserver_requests(sites) == 0
+    assert not cfg.ledger_path.exists()
+
+
 # --- gates ----------------------------------------------------------------
 
 @pytest.mark.parametrize("environ", [{}, {"ALLOW_LIVE": ""}, {"ALLOW_LIVE": "0"}, {"ALLOW_LIVE": "true"},

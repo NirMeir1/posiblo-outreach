@@ -1,2 +1,4 @@
 # The message template must be byte-identical on every machine: never convert line endings.
 templates/*.txt text eol=lf
+# Proposal patches must keep LF line endings so `git apply` works on any machine.
+*.patch text eol=lf

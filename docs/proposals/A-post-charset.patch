@@ -1,0 +1,312 @@
+diff --git a/src/outreach/classify.py b/src/outreach/classify.py
+index 629fc29..f24d5ef 100644
+--- a/src/outreach/classify.py
++++ b/src/outreach/classify.py
+@@ -21,6 +21,7 @@ from urllib.parse import urljoin, urlsplit
+ 
+ from bs4 import Tag
+ 
++from .fetch import normalize_charset
+ from .normalize import registrable_domain
+ 
+ READY = "ready"
+@@ -82,6 +83,7 @@ class FormPlan:
+     honeypots: list[str] = field(default_factory=list)
+     ignored_optional: list[str] = field(default_factory=list)
+     submit: tuple[str, str] | None = None
++    charset: str = "utf-8"  # how the browser would encode this form: accept-charset, else page encoding, else UTF-8
+ 
+     def roles(self) -> dict[str, list[str]]:
+         out: dict[str, list[str]] = {}
+@@ -94,7 +96,7 @@ class FormPlan:
+ 
+     def summary(self) -> str:
+         lines = [f"form page: {self.form_url}",
+-                 f"submits to: {self.action_url} ({self.method.upper()}, {self.encoding})"]
++                 f"submits to: {self.action_url} ({self.method.upper()}, {self.encoding}, charset {self.charset})"]
+         for f in self.fields:
+             extra = f", {f.part}" if f.part else ""
+             lines.append(f"  fill {f.name!r} as {f.role}{extra}{' (required)' if f.required else ''}"
+@@ -210,11 +212,23 @@ def classify_field(el: Tag, label: str) -> tuple[str, str | None] | None:
+     return None
+ 
+ 
+-def build_plan(form: Tag, page_url: str) -> PlanResult:
++def form_charset(form: Tag, page_encoding: str | None) -> str:
++    """The charset a browser would submit this form in (HTML spec order)."""
++    raw = form.get("accept-charset", "")
++    raw = " ".join(raw) if isinstance(raw, list) else str(raw)  # BeautifulSoup returns a list for this attribute
++    for label in re.split(r"[\s,]+", raw):
++        codec = normalize_charset(label)
++        if codec:
++            return codec
++    return normalize_charset(page_encoding) or "utf-8"
++
++
++def build_plan(form: Tag, page_url: str, page_encoding: str | None = None) -> PlanResult:
+     method = str(form.get("method", "get")).strip().lower() or "get"
+     encoding = str(form.get("enctype", "")).strip().lower() or "application/x-www-form-urlencoded"
+     action = urljoin(page_url, str(form.get("action", "")).strip() or page_url)
+-    plan = FormPlan(form_url=page_url, action_url=action, method=method, encoding=encoding)
++    plan = FormPlan(form_url=page_url, action_url=action, method=method, encoding=encoding,
++                    charset=form_charset(form, page_encoding))
+ 
+     a, p = urlsplit(action), urlsplit(page_url)
+     if a.scheme not in ("http", "https"):
+diff --git a/src/outreach/fetch.py b/src/outreach/fetch.py
+index a833378..277b249 100644
+--- a/src/outreach/fetch.py
++++ b/src/outreach/fetch.py
+@@ -16,6 +16,7 @@
+ 
+ from __future__ import annotations
+ 
++import codecs
+ import re
+ import threading
+ import time
+@@ -53,6 +54,7 @@ class FetchResult:
+     text: str = ""
+     detail: str = ""
+     redirects: list[str] = field(default_factory=list)
++    encoding: str = "utf-8"  # the codec the body was decoded with
+ 
+     @property
+     def ok(self) -> bool:
+@@ -90,6 +92,25 @@ class _RobotsPolicy:
+ 
+ def decode_body(body: bytes, content_type: str | None) -> str:
+     """Decode an HTML body, getting Hebrew legacy encodings right."""
++    return decode_body_with_encoding(body, content_type)[0]
++
++
++def normalize_charset(name: str | None) -> str | None:
++    """Python codec name for an HTML/HTTP charset label, or None if unknown."""
++    if not name:
++        return None
++    label = name.strip().strip("\"'").lower()
++    if label in _HEBREW_ALIASES:
++        return "cp1255"
++    try:
++        codec = codecs.lookup(label).name
++    except LookupError:
++        return None
++    return "utf-8" if codec in ("utf-8-sig", "utf_8") else codec
++
++
++def decode_body_with_encoding(body: bytes, content_type: str | None) -> tuple[str, str]:
++    """(text, codec used). Same rules as decode_body."""
+     candidates: list[str] = []
+     m = re.search(r"charset=[\"']?([\w.:-]+)", content_type or "", re.I)
+     if m:
+@@ -101,15 +122,17 @@ def decode_body(body: bytes, content_type: str | None) -> str:
+     if body.startswith(b"\xef\xbb\xbf"):
+         candidates.insert(0, "utf-8-sig")
+     for enc in candidates:
+-        enc = "cp1255" if enc.lower() in _HEBREW_ALIASES else enc
++        codec = "utf-8-sig" if enc == "utf-8-sig" else normalize_charset(enc)
++        if codec is None:
++            continue
+         try:
+-            return body.decode(enc)
++            return body.decode(codec), "utf-8" if codec == "utf-8-sig" else codec
+         except (LookupError, UnicodeDecodeError):
+             continue
+     try:
+-        return body.decode("utf-8")
++        return body.decode("utf-8"), "utf-8"
+     except UnicodeDecodeError:
+-        return body.decode("cp1255", errors="replace")
++        return body.decode("cp1255", errors="replace"), "cp1255"
+ 
+ 
+ def _host_key(url: str) -> str:
+@@ -204,8 +227,8 @@ class Fetcher:
+             if raw.status >= 400:
+                 return FetchResult(url, current, FETCH_ERROR, raw.status, ctype, redirects=redirects,
+                                    detail=f"HTTP {raw.status}")
+-            return FetchResult(url, current, OK, raw.status, ctype, decode_body(raw.body, ctype),
+-                               redirects=redirects)
++            text, encoding = decode_body_with_encoding(raw.body, ctype)
++            return FetchResult(url, current, OK, raw.status, ctype, text, redirects=redirects, encoding=encoding)
+         raise AssertionError("unreachable")
+ 
+     def _wait_for_host(self, url: str) -> None:
+diff --git a/src/outreach/finder.py b/src/outreach/finder.py
+index 9e3a522..a067c59 100644
+--- a/src/outreach/finder.py
++++ b/src/outreach/finder.py
+@@ -178,12 +178,13 @@ def _js_only_hint(soup: BeautifulSoup) -> str:
+     return ""
+ 
+ 
+-def _evaluate_form(form: Tag, html: str, page_url: str, start_url: str, pages: list[str]) -> FindResult:
++def _evaluate_form(form: Tag, html: str, page_url: str, start_url: str, pages: list[str],
++                   page_encoding: str | None = None) -> FindResult:
+     marker = captcha_marker(html)
+     if marker:
+         return FindResult(CAPTCHA, start_url, page_url, None, f"CAPTCHA on the form page ({marker}); skipped",
+                           pages)
+-    result = build_plan(form, page_url)
++    result = build_plan(form, page_url, page_encoding)
+     if result.status != READY:
+         return FindResult(UNCLEAR, start_url, page_url, result.plan, result.detail, pages)
+     return FindResult(READY, start_url, page_url, result.plan, "", pages)
+@@ -206,7 +207,7 @@ def find_contact_form(start_url: str, fetcher: FetcherLike, max_extra_fetches: i
+     soup = _soup(home.text)
+     form, notes = choose_form(soup)
+     if form is not None:
+-        return _evaluate_form(form, home.text, home.url, start_url, pages)
++        return _evaluate_form(form, home.text, home.url, start_url, pages, home.encoding)
+ 
+     seen = {_canon(home.url), _canon(start_url)}
+     root = urlunsplit(urlsplit(home.url)[:2] + ("", "", ""))
+@@ -241,7 +242,7 @@ def find_contact_form(start_url: str, fetcher: FetcherLike, max_extra_fetches: i
+         excluded += notes
+         hint = hint or _js_only_hint(psoup)
+         if form is not None:
+-            return _evaluate_form(form, page.text, page.url, start_url, pages)
++            return _evaluate_form(form, page.text, page.url, start_url, pages, page.encoding)
+         if "login" in notes:
+             login_seen = True
+ 
+diff --git a/src/outreach/send.py b/src/outreach/send.py
+index bb1f806..a6909e7 100644
+--- a/src/outreach/send.py
++++ b/src/outreach/send.py
+@@ -99,6 +99,7 @@ def plan_signature(plan: FormPlan | dict) -> dict:
+         "fields": sorted((f["name"], f["role"], f.get("part"), bool(f["required"])) for f in d["fields"]),
+         "hidden": sorted(d.get("hidden_fields", {})),
+         "honeypots": sorted(d.get("honeypots", [])),
++        "charset": d.get("charset", "utf-8"),
+     }
+ 
+ 
+@@ -146,13 +147,18 @@ def build_payload(plan: FormPlan, config: Config, message: str) -> list[tuple[st
+ # --- the single POST --------------------------------------------------------
+ 
+ def _post_once(client: httpx.Client, plan: FormPlan, pairs: list[tuple[str, str]]) -> PostOutcome:
+-    """THE ONLY HTTP POST IN THIS CODEBASE. Exactly one attempt; never retried; never raises for HTTP errors."""
++    """THE ONLY HTTP POST IN THIS CODEBASE. Exactly one attempt; never retried; never raises for HTTP errors.
++
++    Values are encoded in the form's charset (accept-charset, else the page encoding, else UTF-8), like a
++    browser; characters the charset cannot represent become HTML character references (&#NNNN;).
++    """
++    charset = plan.charset or "utf-8"
+     origin = "{0.scheme}://{0.netloc}".format(urlsplit(plan.form_url))
+     headers = {"Referer": plan.form_url, "Origin": origin}
+     if plan.encoding == "multipart/form-data":
+-        kwargs = {"files": [(k, (None, v.encode("utf-8"))) for k, v in pairs]}
++        kwargs = {"files": [(k, (None, v.encode(charset, "xmlcharrefreplace"))) for k, v in pairs]}
+     else:
+-        kwargs = {"content": urlencode(pairs, encoding="utf-8").encode("ascii")}
++        kwargs = {"content": urlencode(pairs, encoding=charset, errors="xmlcharrefreplace").encode("ascii")}
+         headers["Content-Type"] = "application/x-www-form-urlencoded"
+     try:
+         with client.stream("POST", plan.action_url, headers=headers, **kwargs) as resp:
+@@ -222,7 +228,7 @@ class _Run:
+         marker = captcha_marker(page.text)
+         if marker:
+             return self._skip(key, f"form page now has a CAPTCHA ({marker})")
+-        rebuilt = build_plan(form, page.url)
++        rebuilt = build_plan(form, page.url, page.encoding)
+         if rebuilt.status != READY or rebuilt.plan is None:
+             return self._skip(key, f"form no longer usable: {rebuilt.detail}")
+         plan = rebuilt.plan
+diff --git a/A-charset/tests/test_charset.py b/tests/test_charset.py
+new file mode 100644
+index 0000000..30ede92
+--- /dev/null
++++ b/tests/test_charset.py
+@@ -0,0 +1,91 @@
++"""Proposal A: the single POST uses the form's charset (accept-charset, else page encoding, else UTF-8)."""
++
++from pathlib import Path
++from urllib.parse import parse_qs
++
++import pytest
++from bs4 import BeautifulSoup
++from pytest_httpserver import HTTPServer
++from werkzeug.wrappers import Response
++
++from outreach.approve import approve_batch
++from outreach.classify import form_charset
++from outreach.config import load_config
++from outreach.dryrun import run_dry_run
++from outreach.fetch import Fetcher
++from outreach.ledger import Ledger
++from outreach.message import render_message
++from outreach.send import plan_signature, run_send
++
++LIVE = {"ALLOW_LIVE": "1"}
++
++
++def form(attrs: str = "") -> object:
++    return BeautifulSoup(f"<form {attrs}></form>", "lxml").find("form")
++
++
++@pytest.mark.parametrize(("attrs", "page", "expected"), [
++    ('accept-charset="windows-1255"', "utf-8", "cp1255"),
++    ('accept-charset="ISO-8859-8"', None, "cp1255"),
++    ('accept-charset="UTF-8"', "cp1255", "utf-8"),
++    ('accept-charset="bogus utf-8"', "cp1255", "utf-8"),     # first label the codec registry knows
++    ('accept-charset="bogus"', "cp1255", "cp1255"),          # unknown label: page encoding
++    ("", "cp1255", "cp1255"),
++    ("", "windows-1255", "cp1255"),
++    ("", None, "utf-8"),
++    ("", "nonsense", "utf-8"),
++])
++def test_form_charset_rules(attrs: str, page, expected: str) -> None:
++    assert form_charset(form(attrs), page) == expected
++
++
++def test_fetcher_reports_the_encoding_it_used(httpserver: HTTPServer) -> None:
++    httpserver.expect_request("/robots.txt").respond_with_data("", status=404)
++    httpserver.expect_request("/he").respond_with_data("<p>שלום</p>".encode("cp1255"),
++                                                       content_type="text/html; charset=windows-1255")
++    httpserver.expect_request("/u").respond_with_data("<p>שלום</p>".encode("utf-8"), content_type="text/html")
++    with Fetcher(delay_seconds=0) as f:
++        assert f.get(httpserver.url_for("/he")).encoding == "cp1255"
++        assert f.get(httpserver.url_for("/u")).encoding == "utf-8"
++
++
++def test_old_approved_plans_without_charset_compare_as_utf8() -> None:
++    plan = {"action_url": "a", "method": "post", "encoding": "x", "fields": [], "hidden_fields": {}, "honeypots": []}
++    assert plan_signature(plan)["charset"] == "utf-8"
++
++
++def _page(charset_attr: str = "") -> bytes:
++    html = f"""<html><head><meta charset="windows-1255"></head><body>
++<form action="/send" method="post" {charset_attr}>
++<label for="n">שם מלא</label><input id="n" name="name" required>
++<label for="e">אימייל</label><input id="e" type="email" name="email" required>
++<label for="m">הודעה</label><textarea id="m" name="message" required></textarea>
++</form></body></html>"""
++    return html.encode("cp1255")
++
++
++@pytest.mark.parametrize(("charset_attr", "wire"), [("", "cp1255"), ('accept-charset="utf-8"', "utf-8")])
++def test_post_body_is_encoded_in_the_form_charset(project: Path, httpserver: HTTPServer, charset_attr: str,
++                                                  wire: str) -> None:
++    httpserver.expect_request("/robots.txt").respond_with_data("", status=404)
++    httpserver.expect_request("/", method="GET").respond_with_data(_page(charset_attr),
++                                                                   content_type="text/html")  # charset only in <meta>
++    httpserver.expect_request("/send", method="POST").respond_with_handler(
++        lambda r: Response("<p>תודה! ההודעה נשלחה</p>".encode("utf-8"), content_type="text/html; charset=utf-8"))
++    address = "רחוב הדוגמה 1 → קומה 2"  # "→" does not exist in windows-1255
++    cfg = load_config(root=project, environ={"SENDER_ADDRESS": address, "OUTREACH_HOST_DELAY_SECONDS": "0"})
++    with Ledger(cfg.ledger_path) as led:
++        led.create_batches([[{"site_key": "he-site.co.il", "domain": "127.0.0.1", "input_url": httpserver.url_for("/")}]])
++        with Fetcher(delay_seconds=0) as f:
++            assert run_dry_run(cfg, led, "B0001", fetcher=f, out=lambda s: None).completed
++        approve_batch(led, "B0001", ask=lambda p: "B0001", out=lambda s: None)
++        report = run_send(cfg, led, "B0001", environ=LIVE, out=lambda s: None)
++    assert report.sites[0].result == "sent"
++    post = next(r for r, _ in httpserver.log if r.method == "POST")
++    raw = post.get_data().decode("ascii")                       # urlencoded body is pure ASCII
++    form_data = {k: v[0] for k, v in parse_qs(raw, encoding=wire).items()}
++    expected = render_message(cfg)
++    if wire == "cp1255":
++        expected = expected.replace("→", "&#8594;")            # what a browser sends for unencodable chars
++    assert form_data["message"] == expected
++    assert form_data["name"] == cfg.sender_name

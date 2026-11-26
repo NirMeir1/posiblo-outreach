@@ -197,15 +197,46 @@ def test_server_error_is_not_retried(httpserver: HTTPServer, fetcher: Fetcher) -
     assert paths(httpserver).count("/err") == 1
 
 
-def test_connection_refused_is_a_fetch_error(fetcher: Fetcher) -> None:
+def test_robots_network_error_means_disallow(fetcher: Fetcher) -> None:
+    """robots.txt cannot be reached at all (connection refused): disallow, and the page is not requested."""
     import socket
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens here now
     r = fetcher.get(f"http://127.0.0.1:{port}/")
-    assert r.outcome == ROBOTS_BLOCKED or r.outcome == FETCH_ERROR
-    assert fetcher.requested == [f"http://127.0.0.1:{port}/robots.txt"]  # robots unreachable: page not tried
+    assert r.outcome == ROBOTS_BLOCKED and "not reachable" in r.detail
+    assert fetcher.requested == [f"http://127.0.0.1:{port}/robots.txt"]
+
+
+def test_robots_timeout_means_disallow(httpserver: HTTPServer) -> None:
+    def slow(_request):
+        time.sleep(1.5)
+        return Response("User-agent: *\nAllow: /\n", content_type="text/plain")
+
+    httpserver.expect_request("/robots.txt").respond_with_handler(slow)
+    httpserver.expect_request("/").respond_with_data("page", content_type="text/html")
+    with Fetcher(delay_seconds=0, timeout=0.5) as f:
+        r = f.get(httpserver.url_for("/"))
+    assert r.outcome == ROBOTS_BLOCKED and "timeout" in r.detail
+    time.sleep(1.2)
+    assert paths(httpserver) == ["/robots.txt"]
+
+
+def test_robots_404_means_allow_and_page_is_fetched(httpserver: HTTPServer, fetcher: Fetcher) -> None:
+    httpserver.expect_request("/robots.txt").respond_with_data("Not Found", status=404)
+    httpserver.expect_request("/contact").respond_with_data("<p>contact</p>", content_type="text/html")
+    r = fetcher.get(httpserver.url_for("/contact"))
+    assert r.outcome == OK
+    assert paths(httpserver) == ["/robots.txt", "/contact"]
+
+
+@pytest.mark.parametrize("status", [429])
+def test_robots_429_is_currently_treated_as_allow(httpserver: HTTPServer, fetcher: Fetcher, status: int) -> None:
+    """Documents current behaviour (4xx other than 401/403 = allow). See docs/audit.md for the proposal."""
+    robots(httpserver, "", status=status)
+    httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
+    assert fetcher.get(httpserver.url_for("/")).outcome == OK
 
 
 @pytest.mark.parametrize(("encoding", "content_type", "meta"), [

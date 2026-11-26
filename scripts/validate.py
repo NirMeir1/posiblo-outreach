@@ -39,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 6
+LATEST_IMPLEMENTED_STEP = 7
 
 # CLI commands that must exist (and no others) after each step (A8).
 EXPECTED_COMMANDS: dict[int, list[str]] = {
@@ -48,6 +48,8 @@ EXPECTED_COMMANDS: dict[int, list[str]] = {
     4: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export"],
     5: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen"],
     6: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen", "dashboard",
+        "clear-stop"],
+    7: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen", "dashboard",
         "clear-stop"],
 }
 
@@ -1441,12 +1443,16 @@ def p5_allow_live_and_no_real_send(step: int, state: dict) -> Result:
             elif re.search(r"[\"']ALLOW_LIVE[\"']\s*:\s*[\"']1[\"']", line):
                 mappings.append(f"{f}:{i}")
     setters = sorted(set(setters))
+    # Markdown files only *describe* the command for the owner; they cannot set anything when the tool runs.
+    docs = [s for s in setters if s.split(":", 1)[0].endswith(".md")]
+    setters = [s for s in setters if s not in docs]
     dotenv = ROOT / ".env"
     dotenv_live = dotenv.exists() and "ALLOW_LIVE" in dotenv.read_text(encoding="utf-8-sig", errors="replace")
     in_env = "ALLOW_LIVE" in os.environ
     real_log = ROOT / "logs" / "send-log.jsonl"
     real_ledger = ROOT / "data" / "ledger.db"
-    ev = [f"lines that SET ALLOW_LIVE as an environment variable (tracked + new files): {setters or 'none'}",
+    ev = [f"lines that SET ALLOW_LIVE as an environment variable (code, config, scripts): {setters or 'none'}",
+          f"documentation that shows the owner the command (not executed by anything): {docs or 'none'}",
           f"test-only {{'ALLOW_LIVE': '1'}} mappings passed to run_send(environ=...), not environment variables: "
           f"{len(sorted(set(mappings)))} ({', '.join(sorted(set(mappings))[:4])}{', ...' if len(set(mappings)) > 4 else ''})",
           f".env exists: {dotenv.exists()}; .env mentions ALLOW_LIVE: {dotenv_live}",
@@ -1639,6 +1645,98 @@ def p6_live_dashboard(step: int, state: dict) -> Result:
     return Result("P6.6", "PASS" if ok else "FAIL", ev)
 
 
+# --- After Prompt 7 -------------------------------------------------------
+
+AUDIT = ROOT / "docs" / "audit.md"
+PROMPT6_COMMIT = "5c5843e"  # last commit before the audit; src/ must be unchanged since then
+
+
+def p7_audit_report(step: int, state: dict) -> Result:
+    text = AUDIT.read_text(encoding="utf-8-sig") if AUDIT.exists() else ""
+    needed = {
+        "every POST path": r"^## 1\. Every code path that performs an HTTP POST",
+        "LLM/AI scan result": r"^## 2\. LLM / AI SDK scan",
+        "normalizer review": r"^## 3\. Normalizer",
+        "crash-window analysis": r"^## 4\. Crash windows",
+        "concurrency analysis": r"^## 5\. Concurrency",
+        "ledger deleted": r"^## 6\. If the ledger file is deleted",
+        "power-loss analysis": r"^## 7\. Power loss",
+        "no clear/downgrade of pending/sent/sent_unconfirmed": r"^## 8\. Can any code path clear or downgrade",
+        "gitignore / tracked data": r"^## 9\. Personal data and git",
+        "robots.txt question": r"^### 10\.1 robots\.txt",
+        "POST encoding question": r"^### 10\.2 POST encoding",
+        "reopen recommendation": r"^### 10\.3 reopen",
+        "ranked residual risks": r"^## 12\. Residual risks, ranked",
+    }
+    ev, ok = [], bool(text)
+    for label, pat in needed.items():
+        found = bool(re.search(pat, text, re.M))
+        ok &= found
+        ev.append(f"{label}: {'present' if found else 'MISSING'}")
+    risks = re.findall(r"^(\d+)\. \*\*", text.split("## 12.", 1)[-1], re.M) if "## 12." in text else []
+    ev.append(f"ranked risks listed: {len(risks)} ({', '.join(risks)})")
+    ok &= len(risks) >= 3 and risks == [str(i) for i in range(1, len(risks) + 1)]
+    single = re.search(r"\*\*The only POST the tool makes\.\*\*", text)
+    ev.append(f"report states exactly one POST path: {bool(single)}")
+    return Result("P7.1", "PASS" if ok and single else "FAIL", ev)
+
+
+def p7_readme(step: int, state: dict) -> Result:
+    text = (ROOT / "README.md").read_text(encoding="utf-8-sig")
+    sections = {s: bool(re.search(rf"^## {s}\b", text, re.M)) for s in ("Setup", "Workflow", "Settings",
+                                                                        "Backup and restore", "Known limits")}
+    wf = text.split("## Workflow", 1)[-1].split("\n## ", 1)[0]
+    order = [wf.find(f"python -m outreach {c}") for c in ("ingest", "dry-run", "approve", "dashboard", "send")]
+    order_ok = all(i >= 0 for i in order) and order == sorted(order)
+    proc = _run_project_code("from outreach.config import SETTINGS\nfor s in SETTINGS: print(s.env)")
+    envs = proc.stdout.split()
+    missing = [e for e in envs if f"`{e}`" not in text]
+    limits = text.split("## Known limits", 1)[-1]
+    limit_ok = {"JS-only sites": "JavaScript" in limits, "no CAPTCHA handling": "CAPTCHA" in limits,
+                "legal questions": "Legal" in limits or "legal" in limits}
+    restore = "To restore" in text and "newest" in text
+    ev = [f"sections: {sections}", f"workflow order ingest < dry-run < approve < dashboard < send: {order_ok} "
+          f"(positions {order})", f"settings documented: {len(envs) - len(missing)}/{len(envs)}"
+          + (f" missing {missing}" if missing else ""), f"known limits: {limit_ok}", f"restore steps present: {restore}"]
+    ok = all(sections.values()) and order_ok and envs and not missing and all(limit_ok.values()) and restore
+    return Result("P7.2", "PASS" if ok else "FAIL", ev)
+
+
+def p7_no_behavior_change(step: int, state: dict) -> Result:
+    diff = _run(["git", "diff", "--stat", PROMPT6_COMMIT, "--", "src"]).stdout.strip()
+    untracked = [l for l in _run(["git", "status", "--porcelain", "-uall", "--", "src"]).stdout.splitlines()
+                 if l.startswith("??")]
+    patches = sorted((ROOT / "docs" / "proposals").glob("*.patch"))
+    applies = {}
+    for p in patches:
+        applies[p.name] = _run(["git", "apply", "--check", str(p)]).returncode == 0
+    ev = [f"`git diff {PROMPT6_COMMIT} -- src` (committed + working tree): {diff or 'empty'}",
+          f"untracked files in src/: {untracked or 'none'}",
+          f"behavior changes kept as proposals, not applied: {[p.name for p in patches]}",
+          f"each proposal applies cleanly (git apply --check): {applies}"]
+    ok = not diff and not untracked and len(patches) == 3 and all(applies.values())
+    return Result("P7.3", "PASS" if ok else "FAIL", ev)
+
+
+def p7_llm_scan_repo(step: int, state: dict) -> Result:
+    pat = re.compile(_AI_RE.pattern + r"|(?<![A-Za-z0-9_])(gpt-[0-9]|chatgpt|gemini)(?![A-Za-z0-9_])", re.I)
+    exempt = {"scripts/validate.py", "docs/validation.md", "docs/audit.md"}  # they list the forbidden names
+    hits = []
+    for f in _git_ls_files():
+        if f in exempt:
+            continue
+        try:
+            text = (ROOT / f).read_text(encoding="utf-8-sig")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if pat.search(line):
+                hits.append(f"{f}:{i}")
+    ev = [f"tracked files scanned (except {sorted(exempt)}, which list the forbidden names): "
+          f"{len(_git_ls_files()) - len(exempt)}", f"matches: {hits or 'none'}"]
+    return Result("P7.4", "FAIL" if hits else "PASS", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
@@ -1650,6 +1748,7 @@ STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     5: [p5_single_post, p5_gates, p5_order, p5_no_retry, p5_required_tests, p5_reopen, p5_mutations,
         p5_allow_live_and_no_real_send],
     6: [p6_bind, p6_read_only, p6_stop, p6_assets, p6_own_process, p6_live_dashboard],
+    7: [p7_audit_report, p7_readme, p7_no_behavior_change, p7_llm_scan_repo],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,

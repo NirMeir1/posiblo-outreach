@@ -1,0 +1,106 @@
+diff --git a/src/outreach/preflight.py b/src/outreach/preflight.py
+index 15d862a..a8ffb6d 100644
+--- a/src/outreach/preflight.py
++++ b/src/outreach/preflight.py
+@@ -1,7 +1,7 @@
+ """Checks that must pass before a command may touch the ledger or send.
+ 
+-Order (fixed): STOP file, ledger integrity, missing-ledger guard, template,
+-sender details (live mode only). All checks run; run_preflight() returns the
++Order (fixed): STOP file, ledger integrity, missing-ledger guard, send-log /
++ledger consistency, template, sender details (live mode only). All checks run; run_preflight() returns the
+ list of failure messages (empty list = OK).
+ """
+ 
+@@ -73,12 +73,37 @@ def preflight_checks(config: Config, *, live: bool = False, require_no_stop: boo
+     else:
+         checks.append(Check("ledger_missing", True, "ledger present"))
+ 
+-    # 4. Message template
++    # 4. Every site the send log says was claimed must be in the ledger. A ledger restored from a backup
++    #    older than the last send would otherwise "forget" those sites and could contact them again.
++    sendlog = SendLog(config.send_log_path)
++    if ledger.exists() and sendlog.exists():
++        try:
++            claimed = {r.get("site_key") for r in sendlog.read() if r.get("event") == "claimed" and r.get("site_key")}
++            conn = sqlite3.connect(f"{ledger.resolve().as_uri()}?mode=ro", uri=True)
++            try:
++                known = {row[0] for row in conn.execute("SELECT site_key FROM sites")}
++            finally:
++                conn.close()
++            missing = sorted(claimed - known)
++            if missing:
++                detail = (f"{len(missing)} site(s) claimed in the send log {sendlog.path} are MISSING from the ledger "
++                          f"(e.g. {', '.join(missing[:5])}). The ledger was probably restored from an older backup. "
++                          "Refusing to run: those sites could be contacted again. Restore a newer backup, or stop "
++                          "and reconcile the ledger with the send log by hand.")
++            else:
++                detail = f"all {len(claimed)} claimed site(s) in the send log are in the ledger"
++            checks.append(Check("sendlog_consistency", not missing, detail))
++        except (sqlite3.Error, OSError, ValueError) as e:
++            checks.append(Check("sendlog_consistency", False, f"could not compare the send log with the ledger: {e}"))
++    else:
++        checks.append(Check("sendlog_consistency", True, "nothing to compare"))
++
++    # 5. Message template
+     tpl = config.template_path
+     checks.append(Check("template", tpl.is_file(),
+                         f"template {tpl} found" if tpl.is_file() else f"template {tpl} is missing"))
+ 
+-    # 5. Sender details (live mode only)
++    # 6. Sender details (live mode only)
+     if live:
+         bad = config.sender_placeholders()
+         checks.append(Check("sender_details", not bad,
+diff --git a/tests/test_preflight.py b/tests/test_preflight.py
+index 8ad435e..3c50a95 100644
+--- a/tests/test_preflight.py
++++ b/tests/test_preflight.py
+@@ -108,7 +108,8 @@ def test_todo_sender_rejected_in_live_mode_only(project: Path) -> None:
+ def test_checks_run_in_required_order(project: Path) -> None:
+     cfg = _cfg(project)
+     names = [c.name for c in preflight_checks(cfg, live=True)]
+-    assert names == ["stop_file", "ledger_integrity", "ledger_missing", "template", "sender_details"]
++    assert names == ["stop_file", "ledger_integrity", "ledger_missing", "sendlog_consistency", "template",
++                     "sender_details"]
+     assert [c.name for c in preflight_checks(cfg, live=False)][-1] == "template"
+ 
+ 
+@@ -123,3 +124,24 @@ def test_all_failures_reported_in_order(project: Path) -> None:
+     assert "MISSING" in failures[1]
+     assert "template" in failures[2]
+     assert "sender details" in failures[3]
++
++
++def test_refuses_when_send_log_claims_are_missing_from_a_restored_ledger(project: Path) -> None:
++    """Restore from a backup taken before the last send: the send log still knows the newer claims."""
++    import shutil
++    cfg = _cfg(project)
++    log = SendLog(cfg.send_log_path)
++    with Ledger(cfg.ledger_path) as led:
++        led.claim("a.co.il", domain="a.co.il", input_url="x")
++        log.append("claimed", site_key="a.co.il")
++        old_backup = create_backup(cfg).local
++        led.claim("b.co.il", domain="b.co.il", input_url="x")
++        log.append("claimed", site_key="b.co.il")
++    assert run_preflight(cfg) == []                       # consistent before the restore
++    for suffix in ("-wal", "-shm"):
++        Path(str(cfg.ledger_path) + suffix).unlink(missing_ok=True)
++    shutil.copyfile(old_backup, cfg.ledger_path)          # the operator restores the older backup
++    failures = run_preflight(cfg)
++    assert len(failures) == 1
++    assert "MISSING from the ledger" in failures[0] and "b.co.il" in failures[0]
++    assert run_preflight(cfg, live=True, require_no_stop=False)[0] == failures[0]
+diff --git a/scripts/validate.py b/scripts/validate.py
+index 6079eca..7c6fb94 100644
+--- a/scripts/validate.py
++++ b/scripts/validate.py
+@@ -898,7 +898,7 @@ def p2_preflight(step: int, state: dict) -> Result:
+     for m in re.finditer(r'Check\("([a-z_]+)"', pf.read_text(encoding="utf-8-sig")):
+         if m.group(1) not in order:
+             order.append(m.group(1))
+-    expected = ["stop_file", "ledger_integrity", "ledger_missing", "template", "sender_details"]
++    expected = ["stop_file", "ledger_integrity", "ledger_missing", "sendlog_consistency", "template", "sender_details"]
+     integrity = _lines_matching(pf, r"PRAGMA integrity_check")
+     live_only = _lines_matching(pf, r"if live:")
+     ok, ev = _required(state, {
