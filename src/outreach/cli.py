@@ -10,12 +10,18 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .approve import ApprovalRefused, approve_batch
 from .backup import BackupError, create_backup, list_backups
 from .config import ConfigError, load_config
+from .dryrun import run_dry_run
+from .export import export_batch
 from .ingest import IngestError, ingest
-from .ledger import SUPPRESSION_KINDS, Ledger, open_readonly, status_summary
+from .ledger import SUPPRESSION_KINDS, Ledger, LedgerError, open_readonly, status_summary
+from .message import MessageError
 from .normalize import InvalidUrl
 from .preflight import run_preflight
+
+REPORTS_DIRNAME = "reports"
 
 
 def _print_failures(failures: list[str]) -> None:
@@ -103,6 +109,53 @@ def cmd_suppress_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dry_run(args: argparse.Namespace) -> int:
+    config = load_config()
+    failures = run_preflight(config, live=False)
+    if failures:
+        _print_failures(failures)
+        return 1
+    with Ledger(config.ledger_path) as led:
+        try:
+            report = run_dry_run(config, led, args.batch_id)
+        except (ValueError, LedgerError, MessageError) as e:
+            print(f"dry-run: {e}", file=sys.stderr)
+            return 2
+    return 0 if report.completed else 1
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    config = load_config()
+    failures = run_preflight(config, live=False)
+    if failures:
+        _print_failures(failures)
+        return 1
+    with Ledger(config.ledger_path) as led:
+        try:
+            approve_batch(led, args.batch_id)
+        except ApprovalRefused as e:
+            print(f"approve: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    config = load_config()
+    if not config.ledger_path.is_file():
+        print(f"no ledger at {config.ledger_path}", file=sys.stderr)
+        return 1
+    conn = open_readonly(config.ledger_path)
+    try:
+        path = export_batch(conn, args.batch_id, config.root / REPORTS_DIRNAME)
+    except ValueError as e:
+        print(f"export: {e}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    print(f"report written: {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m outreach",
                                 description="Posiblo outreach: one consent-request message per site, sent once.")
@@ -126,6 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("value")
     sa.add_argument("--reason", default=None)
     sa.set_defaults(func=cmd_suppress_add)
+
+    sp = sub.add_parser("dry-run", help="visit each site of a batch and report what would be sent (sends nothing)")
+    sp.add_argument("batch_id")
+    sp.set_defaults(func=cmd_dry_run)
+
+    sp = sub.add_parser("approve", help="approve a dry-run batch (type the batch id to confirm); freezes the list")
+    sp.add_argument("batch_id")
+    sp.set_defaults(func=cmd_approve)
+
+    sp = sub.add_parser("export", help="write reports/<batch_id>-<timestamp>.csv (never overwrites)")
+    sp.add_argument("batch_id")
+    sp.set_defaults(func=cmd_export)
     return p
 
 

@@ -39,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 3
+LATEST_IMPLEMENTED_STEP = 4
 
 # CLI commands that must exist (and no others) after each step (A8).
 EXPECTED_COMMANDS: dict[int, list[str]] = {
@@ -1092,6 +1092,89 @@ def p3_extra_fetches(step: int, state: dict) -> Result:
     return Result("P3.6", "PASS" if ok and const else "FAIL", (const or ["MAX_EXTRA_FETCHES != 3"]) + ev)
 
 
+# --- After Prompt 4 -------------------------------------------------------
+
+def _calls_in(path: Path) -> list[tuple[int, str]]:
+    """(line, attribute-or-function name) for every call in a module."""
+    out = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+            out.append((node.lineno, name))
+    return out
+
+
+def p4_dry_run_no_claim(step: int, state: dict) -> Result:
+    offenders = []
+    for mod in ("dryrun.py", "approve.py", "export.py"):
+        p = SRC / "outreach" / mod
+        offenders += [f"{_rel(p)}:{ln}: {name}()" for ln, name in _calls_in(p) if name in ("claim", "finish")]
+    ok, ev = _required(state, {
+        "sites table stays empty, claim()/finish() never called":
+            "tests/test_dryrun.py::test_dry_run_leaves_sites_table_empty_and_never_claims",
+        "CLI dry-run on local server: GET only, sites table empty":
+            "tests/test_dryrun.py::test_cli_dry_run_against_local_server",
+        "approve does not touch sites": "tests/test_approve.py::test_approve_does_not_touch_sites_table",
+    })
+    ev.insert(0, f"claim()/finish() calls in dryrun.py, approve.py, export.py: {offenders or 'none'}")
+    return Result("P4.1", "PASS" if ok and not offenders else "FAIL", ev)
+
+
+def p4_dry_run_results(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "results written + state dry_run_done": "tests/test_dryrun.py::test_dry_run_records_outcomes_and_sets_state",
+        "re-run replaces results": "tests/test_dryrun.py::test_rerun_replaces_previous_results",
+        "STOP file halts (stays planned)": "tests/test_dryrun.py::test_stop_file_halts_and_batch_cannot_be_approved",
+        "circuit breaker halts": "tests/test_dryrun.py::test_circuit_breaker_halts_after_consecutive_fetch_errors",
+        "suppressed/handled not fetched": "tests/test_dryrun.py::test_suppressed_and_handled_sites_are_not_fetched",
+    })
+    delete = _lines_matching(SRC / "outreach" / "ledger.py", r"DELETE FROM dry_run_results")
+    ev.append(f"replacement is done by: {delete}")
+    return Result("P4.2", "PASS" if ok and delete else "FAIL", ev)
+
+
+def p4_report_message(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "report has one line per site + the exact message":
+            "tests/test_dryrun.py::test_report_shows_each_site_and_exact_message",
+        "message uses the configured address": "tests/test_dryrun.py::test_message_uses_configured_address",
+    })
+    return Result("P4.3", "PASS" if ok else "FAIL", ev)
+
+
+def p4_approve(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "refuses before dry-run": "tests/test_approve.py::test_approve_refuses_before_dry_run",
+        "refuses after a halted dry-run": "tests/test_approve.py::test_approve_refuses_after_halted_dry_run",
+        "requires typing the batch id": "tests/test_approve.py::test_approve_requires_typing_the_batch_id[",
+        "approved list = ready sites only": "tests/test_approve.py::test_approved_list_contains_only_ready_sites",
+        "approved list frozen (triggers)": "tests/test_approve.py::test_approved_list_is_frozen",
+        "approve twice refused": "tests/test_approve.py::test_approve_twice_is_refused",
+        "dry-run refused after approval": "tests/test_dryrun.py::test_dry_run_refused_after_approval",
+        "CLI reads typed confirmation": "tests/test_approve.py::test_cli_approve_reads_typed_confirmation",
+    })
+    gate = _lines_matching(SRC / "outreach" / "ledger.py", r"if row\[0\] != \"dry_run_done\"")
+    only_ready = _lines_matching(SRC / "outreach" / "ledger.py", r"d\.outcome = 'ready'")
+    ev = gate + only_ready + ev
+    return Result("P4.4", "PASS" if ok and gate and only_ready else "FAIL", ev)
+
+
+def p4_export(step: int, state: dict) -> Result:
+    ex = SRC / "outreach" / "export.py"
+    opens = _lines_matching(ex, r"\bopen\(")
+    x_only = bool(opens) and all(re.search(r"open\([^)]*\"x\"", o) for o in opens)
+    ok, ev = _required(state, {
+        "writes a new report under reports/": "tests/test_export.py::test_export_writes_a_new_report",
+        "never overwrites": "tests/test_export.py::test_export_never_overwrites",
+        "input CSV untouched": "tests/test_export.py::test_cli_ingest_dry_run_export_never_touches_input_csv",
+    })
+    reads_csv = _lines_matching(ex, r"read_csv|ingest")
+    ev = [f"open() calls in export.py: {opens}; exclusive-create mode 'x' only: {x_only}",
+          f"export.py reads the input CSV: {reads_csv or 'no'}"] + ev
+    return Result("P4.5", "PASS" if ok and x_only and not reads_csv else "FAIL", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
@@ -1099,12 +1182,14 @@ STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     2: [p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
         p2_no_fetch],
     3: [p3_no_post, p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches],
+    4: [p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export, p3_no_post],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
               p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations,
               p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
-              p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches}
+              p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches,
+              p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export}
 
 
 # --- driver ---------------------------------------------------------------

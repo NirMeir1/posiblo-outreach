@@ -90,6 +90,29 @@ CREATE TABLE IF NOT EXISTS dry_run_results (
     created_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS approved_sites (
+    batch_id    TEXT NOT NULL REFERENCES batches(batch_id),
+    site_key    TEXT NOT NULL,
+    input_url   TEXT NOT NULL,
+    domain      TEXT NOT NULL,
+    form_url    TEXT,
+    fields_json TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, site_key)
+);
+
+CREATE TRIGGER IF NOT EXISTS approved_sites_frozen_update
+BEFORE UPDATE ON approved_sites
+BEGIN
+    SELECT RAISE(ABORT, 'ledger: the approved list of a batch is frozen');
+END;
+
+CREATE TRIGGER IF NOT EXISTS approved_sites_frozen_delete
+BEFORE DELETE ON approved_sites
+BEGIN
+    SELECT RAISE(ABORT, 'ledger: the approved list of a batch is frozen');
+END;
+
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -318,6 +341,85 @@ class Ledger:
     def batch_sites(self, batch_id: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self._conn.execute(
             "SELECT * FROM batch_sites WHERE batch_id = ? ORDER BY position", (batch_id,)).fetchall()]
+
+    def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    # -- dry run ------------------------------------------------------------
+    def start_dry_run(self, batch_id: str) -> None:
+        """Reset a batch for a (re-)run: state back to planned, old dry-run results removed.
+
+        Refused for an approved batch (its approved list is frozen).
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT state FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if row is None:
+                raise LedgerError(f"no batch {batch_id!r}")
+            if row[0] not in ("planned", "dry_run_done"):
+                raise LedgerError(f"batch {batch_id} is {row[0]}; dry-run is only allowed before approval")
+            conn.execute("UPDATE batches SET state = 'planned' WHERE batch_id = ?", (batch_id,))
+            conn.execute("DELETE FROM dry_run_results WHERE batch_id = ?", (batch_id,))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    def add_dry_run_result(self, batch_id: str, site_key: str, outcome: str, form_url: str | None,
+                           fields_json: str | None, detail: str | None) -> None:
+        self._conn.execute(
+            "INSERT INTO dry_run_results (batch_id, site_key, outcome, form_url, fields_json, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (batch_id, site_key, outcome, form_url, fields_json, detail, _now()))
+
+    def finish_dry_run(self, batch_id: str) -> None:
+        cur = self._conn.execute(
+            "UPDATE batches SET state = 'dry_run_done' WHERE batch_id = ? AND state = 'planned'", (batch_id,))
+        if cur.rowcount != 1:
+            raise LedgerError(f"batch {batch_id} is not in state planned")
+
+    def dry_run_results(self, batch_id: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT d.* FROM dry_run_results d LEFT JOIN batch_sites s "
+            "ON s.batch_id = d.batch_id AND s.site_key = d.site_key "
+            "WHERE d.batch_id = ? ORDER BY s.position, d.rowid", (batch_id,)).fetchall()]
+
+    # -- approval -------------------------------------------------------------
+    def approve(self, batch_id: str) -> int:
+        """Freeze the `ready` sites of a dry-run-done batch and mark it approved. Returns how many."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT state FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if row is None:
+                raise LedgerError(f"no batch {batch_id!r}")
+            if row[0] != "dry_run_done":
+                raise LedgerError(f"batch {batch_id} is {row[0]}; approve needs a completed dry-run (dry_run_done)")
+            now = _now()
+            cur = conn.execute(
+                "INSERT INTO approved_sites (batch_id, site_key, input_url, domain, form_url, fields_json, approved_at) "
+                "SELECT d.batch_id, d.site_key, s.input_url, s.domain, d.form_url, d.fields_json, ? "
+                "FROM dry_run_results d JOIN batch_sites s ON s.batch_id = d.batch_id AND s.site_key = d.site_key "
+                "WHERE d.batch_id = ? AND d.outcome = 'ready' ORDER BY s.position",
+                (now, batch_id))
+            count = cur.rowcount
+            conn.execute("UPDATE batches SET state = 'approved', approved_at = ? WHERE batch_id = ? "
+                         "AND state = 'dry_run_done'", (now, batch_id))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return count
+
+    def approved_sites(self, batch_id: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT a.* FROM approved_sites a LEFT JOIN batch_sites s "
+            "ON s.batch_id = a.batch_id AND s.site_key = a.site_key "
+            "WHERE a.batch_id = ? ORDER BY s.position", (batch_id,)).fetchall()]
 
     # -- events -----------------------------------------------------------
     def add_event(self, level: str, message: str, site_key: str | None = None) -> None:

@@ -12,6 +12,9 @@ Run every command from the project folder (the folder that contains `pyproject.t
 | `python -m outreach status` | Read-only summary: sites per status, batches, suppression counts, backups. |
 | `python -m outreach backup` | Backs up the ledger with the SQLite backup API; keeps the newest 30; also writes to `OFFSITE_BACKUP_DIR` when set. |
 | `python -m outreach suppress add <domain\|email\|phone> <value> [--reason TEXT]` | Never contact this domain, email or phone. |
+| `python -m outreach dry-run <batch_id>` | Visits every site of the batch (GET only, robots.txt respected), finds the contact form and records what would be filled. Sends nothing and claims nothing. Prints one line per site and the exact message text. |
+| `python -m outreach approve <batch_id>` | Only after a complete dry-run. Shows ready/skipped counts and asks you to type the batch id. Freezes the list of `ready` sites. |
+| `python -m outreach export <batch_id>` | Writes `reports/<batch_id>-<timestamp>.csv` as a new file (never overwrites, never touches the input CSV). |
 
 ## Settings
 

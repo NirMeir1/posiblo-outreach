@@ -3,34 +3,13 @@ from urllib.parse import quote
 import pytest
 from bs4 import BeautifulSoup
 
-from conftest import FIXTURES
-from outreach.fetch import FETCH_ERROR, OK, ROBOTS_BLOCKED, FetchResult
+from conftest import FakeFetcher
+from conftest import fixture_html as fx
+from outreach.fetch import OK, FetchResult
 from outreach.finder import (MAX_EXTRA_FETCHES, choose_form, find_contact_form, form_kind,
                              rank_contact_links)
 
 BASE = "https://www.example.co.il"
-
-
-def fx(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
-
-
-class FakeFetcher:
-    """Serves fixture HTML by URL. Unknown URLs are 404s. Records every page requested."""
-
-    def __init__(self, pages: dict[str, str], blocked: set[str] = frozenset(), redirects=None):
-        self.pages, self.blocked, self.redirects = pages, set(blocked), redirects or {}
-        self.requested: list[str] = []
-
-    def get(self, url: str) -> FetchResult:
-        self.requested.append(url)
-        if url in self.blocked:
-            return FetchResult(url, url, ROBOTS_BLOCKED, detail="robots.txt does not allow it")
-        final = self.redirects.get(url, url)
-        if final in self.pages:
-            return FetchResult(url, final, OK, 200, "text/html; charset=utf-8", self.pages[final],
-                               redirects=[final] if final != url else [])
-        return FetchResult(url, final, FETCH_ERROR, 404, detail="HTTP 404")
 
 
 CONTACT = BASE + "/" + quote("צור-קשר") + "/"

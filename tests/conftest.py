@@ -88,6 +88,32 @@ def _clean_outreach_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name, raising=False)
 
 
+class FakeFetcher:
+    """Serves HTML by URL without any network. Unknown URLs are 404s. Records every URL requested."""
+
+    def __init__(self, pages: dict[str, str], blocked=frozenset(), redirects=None, on_get=None):
+        self.pages, self.blocked, self.redirects = pages, set(blocked), redirects or {}
+        self.on_get = on_get
+        self.requested: list[str] = []
+
+    def get(self, url: str):
+        from outreach.fetch import FETCH_ERROR, OK, ROBOTS_BLOCKED, FetchResult
+        self.requested.append(url)
+        if self.on_get:
+            self.on_get(url)
+        if url in self.blocked:
+            return FetchResult(url, url, ROBOTS_BLOCKED, detail="robots.txt does not allow it")
+        final = self.redirects.get(url, url)
+        if final in self.pages:
+            return FetchResult(url, final, OK, 200, "text/html; charset=utf-8", self.pages[final],
+                               redirects=[final] if final != url else [])
+        return FetchResult(url, final, FETCH_ERROR, 404, detail="HTTP 404")
+
+
+def fixture_html(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
 @pytest.fixture
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A throw-away project root (cwd) containing the real message template."""
