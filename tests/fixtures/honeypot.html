@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>צור קשר</title></head>
+<body>
+<h1>צור קשר</h1>
+<form action="/contact" method="post">
+  <input type="hidden" name="nonce" value="n-9f8e7d">
+  <label for="n">שם מלא</label><input id="n" type="text" name="name" required>
+  <label for="e">אימייל</label><input id="e" type="email" name="email" required>
+  <label for="m">הודעה</label><textarea id="m" name="message" required></textarea>
+  <div style="position:absolute; left:-9999px;" aria-hidden="true">
+    <label for="w">Website</label><input id="w" type="text" name="website" value="">
+  </div>
+  <input type="text" name="company_hp" tabindex="-1" autocomplete="off">
+  <input type="text" name="url_check" style="display:none">
+  <button type="submit">שלח</button>
+</form>
+</body>
+</html>

@@ -39,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 2
+LATEST_IMPLEMENTED_STEP = 3
 
 # CLI commands that must exist (and no others) after each step (A8).
 EXPECTED_COMMANDS: dict[int, list[str]] = {
@@ -804,7 +804,7 @@ def _required(state: dict, names: dict[str, str]) -> tuple[bool, list[str]]:
     junit = state.get("junit", {})
     ok, ev = True, []
     for label, name in names.items():
-        if name.endswith("["):
+        if name.endswith(("[", "-")):  # prefix: all parametrized cases (pytest escapes non-ASCII ids)
             hits = {k: v for k, v in junit.items() if k.startswith(name)}
             good = bool(hits) and all(v == "passed" for v in hits.values())
             ev.append(f"{label}: {name}*] -> {len(hits)} case(s), all passed: {good}")
@@ -957,17 +957,154 @@ def p2_no_fetch(step: int, state: dict) -> Result:
     return Result("P2.8", "FAIL" if hits else "PASS", ev)
 
 
+# --- After Prompt 3 -------------------------------------------------------
+
+# Case-sensitive where the protocol is ("POST"); case-insensitive only inside client calls.
+_POST_SEND = re.compile(
+    r"\.post\(|[\"']POST[\"']|(?i:\bmethod\s*=\s*[\"']post[\"'])|(?i:\.request\(\s*[\"']post)"
+    r"|(?i:\.stream\(\s*[\"']post)|\.send\(|urlopen\(|\bhttp\.client\b"
+    r"|\brequests\.(get|post|put|request|Session)\b|^\s*import requests\b")
+
+
+def p3_no_post(step: int, state: dict) -> Result:
+    sends, mentions = [], []
+    for p in _py_files(SRC):
+        for i, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            loc = f"{_rel(p)}:{i}: {line.strip()[:110]}"
+            if _POST_SEND.search(line):
+                sends.append(loc)
+            elif re.search(r"post", line, re.I):
+                mentions.append(loc)
+    client_calls = []
+    for p in _py_files(SRC):
+        client_calls += _lines_matching(p, r"_client\.\w+\(")
+    get_only = client_calls and all(re.search(r"_client\.stream\(\"GET\"|_client\.close\(\)", c) for c in client_calls)
+    ev = [f"request-sending patterns (.post(, \"POST\", method=post, .request/.stream(\"POST\"), .send(, urlopen, "
+          f"http.client, requests.): {sends or 'none'}",
+          f"HTTP client calls in src/: {client_calls}; GET only: {bool(get_only)}"]
+    ev += [f"other 'post' text (not a request, listed for review): {m}" for m in mentions]
+    return Result("P3.1", "PASS" if not sends and get_only else "FAIL", ev)
+
+
+_BROWSER_PKGS = {"playwright", "selenium", "pyppeteer", "splinter", "undetected-chromedriver", "seleniumbase",
+                 "requests-html", "mechanize", "mechanicalsoup", "helium"}
+
+
+def p3_no_browser(step: int, state: dict) -> Result:
+    data = _pyproject()
+    specs = list(data.get("project", {}).get("dependencies", []))
+    for g in data.get("project", {}).get("optional-dependencies", {}).values():
+        specs += g
+    declared = sorted(_dep_name(s) for s in specs)
+    installed = sorted({(d.metadata["Name"] or "").lower() for d in importlib.metadata.distributions()})
+    bad = sorted((set(declared) | set(installed)) & _BROWSER_PKGS)
+    imports = []
+    for p in _py_files(SRC):
+        imports += _lines_matching(p, r"^\s*(import|from)\s+(playwright|selenium|pyppeteer|splinter)\b")
+    ev = [f"declared dependencies: {declared}", f"browser-automation packages declared or installed: {bad or 'none'}",
+          f"browser imports in src/: {imports or 'none'}"]
+    return Result("P3.2", "PASS" if not bad and not imports else "FAIL", ev)
+
+
+def p3_fetcher(step: int, state: dict) -> Result:
+    fp = SRC / "outreach" / "fetch.py"
+    ua = _lines_matching(fp, r'^USER_AGENT = "PosibloOutreachBot/1\.0 \(\+https://posiblo\.com; posiblo\.contact@gmail\.com\)"$')
+    consts = _lines_matching(fp, r"^(TIMEOUT_SECONDS|MAX_BODY_BYTES|MAX_REDIRECTS) = ")
+    retry = _lines_matching(fp, r"retr(y|ies)\s*=|tenacity|backoff|for attempt|while True")
+    retry = [r for r in retry if "No automatic retries" not in r]
+    deps_retry = [l for l in (ROOT / "pyproject.toml").read_text(encoding="utf-8-sig").splitlines()
+                  if re.search(r"tenacity|backoff|retrying|urllib3", l)]
+    ok, ev = _required(state, {
+        "UA sent, GET only": "tests/test_fetch.py::test_sends_honest_user_agent_and_only_get",
+        "robots-disallowed page NOT requested": "tests/test_fetch.py::test_robots_disallowed_page_is_never_requested",
+        "robots cached per host": "tests/test_fetch.py::test_robots_fetched_once_per_host",
+        "robots status handling": "tests/test_fetch.py::test_robots_status_handling[",
+        "per-host delay applied": "tests/test_fetch.py::test_per_host_delay_is_applied",
+        "delay is per host": "tests/test_fetch.py::test_delay_is_per_host",
+        "15 s timeout + no retry": "tests/test_fetch.py::test_timeout_and_no_retry",
+        "2 MB cap (Content-Length)": "tests/test_fetch.py::test_body_cap_with_content_length",
+        "2 MB cap (streamed)": "tests/test_fetch.py::test_body_cap_when_streamed_without_length",
+        "3 redirects followed": "tests/test_fetch.py::test_up_to_three_redirects_followed",
+        "4th redirect refused": "tests/test_fetch.py::test_fourth_redirect_is_refused",
+        "cross-domain redirect refused": "tests/test_fetch.py::test_redirect_to_other_domain_is_refused",
+        "5xx not retried": "tests/test_fetch.py::test_server_error_is_not_retried",
+        "Hebrew decoding": "tests/test_fetch.py::test_hebrew_decoding[",
+        "constants match prompt": "tests/test_fetch.py::test_constants_match_the_prompt",
+    })
+    ev = (ua or ["USER_AGENT line NOT exact"]) + consts + \
+         [f"retry logic in fetch.py: {retry or 'none'}", f"retry libraries in pyproject: {deps_retry or 'none'}"] + ev
+    return Result("P3.3", "PASS" if ok and ua and len(consts) == 3 and not retry and not deps_retry else "FAIL", ev)
+
+
+P3_FIXTURE_CASES = {
+    "Contact Form 7 in Hebrew": "cf7_hebrew.html",
+    "Elementor form": "elementor.html",
+    "plain English form": "plain_english.html",
+    "form with reCAPTCHA": "recaptcha.html",
+    "login page": "login.html",
+    "newsletter-only page": "newsletter.html",
+    "page with no form": "no_form.html",
+    "JS-only page, no static form": "js_only.html",
+    "form with a honeypot": "honeypot.html",
+    "form with an unknown required field": "unknown_required.html",
+    "no-solicitation notice": "no_solicitation.html",
+    "cross-domain action": "cross_domain.html",
+}
+
+
+def p3_fixtures(step: int, state: dict) -> Result:
+    present = sorted(p.name for p in (TESTS / "fixtures").glob("*.html"))
+    missing = [f"{case} ({name})" for case, name in P3_FIXTURE_CASES.items() if name not in present]
+    ev = [f"{len(present)} HTML fixtures: {present}"]
+    ev += [f"{case}: {name} {'present' if name in present else 'MISSING'}" for case, name in P3_FIXTURE_CASES.items()]
+    return Result("P3.4", "PASS" if not missing and len(present) >= 12 else "FAIL", ev)
+
+
+def p3_finder_classifier(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "captcha": "tests/test_finder.py::test_contact_page_outcomes[recaptcha.html-captcha-recaptcha]",
+        "login_required": "tests/test_finder.py::test_contact_page_outcomes[login.html-login_required-log]",
+        "login_required via redirect": "tests/test_finder.py::test_redirect_to_login_is_login_required",
+        "no_form": "tests/test_finder.py::test_contact_page_outcomes[no_form.html-no_form-no usable contact form]",
+        "no_form (JS-only)": "tests/test_finder.py::test_contact_page_outcomes[js_only.html-no_form-JavaScript]",
+        "no_solicitation": "tests/test_finder.py::test_contact_page_outcomes[no_solicitation.html-no_solicitation-",
+        "no_solicitation on homepage": "tests/test_finder.py::test_no_solicitation_on_homepage_stops_immediately",
+        "newsletter-only excluded": "tests/test_finder.py::test_contact_page_outcomes[newsletter.html-no_form-newsletter]",
+        "search form excluded": "tests/test_classify.py::test_plain_english_form_and_search_form_excluded",
+        "form kinds (search/login/newsletter)": "tests/test_finder.py::test_form_kinds[",
+        "honeypot left empty": "tests/test_classify.py::test_honeypot_fields_left_empty_and_hidden_tokens_kept",
+        "unknown REQUIRED -> unclear_fields": "tests/test_classify.py::test_unknown_required_field_gives_unclear_fields",
+        "cross-domain action -> unclear_fields": "tests/test_classify.py::test_cross_domain_action_gives_unclear_fields",
+        "hidden tokens kept (CF7)": "tests/test_classify.py::test_contact_form_7_hebrew",
+        "Elementor": "tests/test_classify.py::test_elementor_form",
+        "robots_blocked contact page": "tests/test_finder.py::test_robots_blocked_contact_page",
+        "end-to-end on local server": "tests/test_fetch.py::test_finder_against_live_local_server",
+    })
+    return Result("P3.5", "PASS" if ok else "FAIL", ev)
+
+
+def p3_extra_fetches(step: int, state: dict) -> Result:
+    const = _lines_matching(SRC / "outreach" / "finder.py", r"^MAX_EXTRA_FETCHES = 3$")
+    ok, ev = _required(state, {
+        "fake fetcher: homepage + 3": "tests/test_finder.py::test_at_most_three_extra_fetches",
+        "local server: homepage + 3": "tests/test_fetch.py::test_finder_extra_fetch_limit_on_live_server",
+    })
+    return Result("P3.6", "PASS" if ok and const else "FAIL", (const or ["MAX_EXTRA_FETCHES != 3"]) + ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
         p1_required_tests, p1_mutations],
     2: [p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
         p2_no_fetch],
+    3: [p3_no_post, p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
               p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations,
-              p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest}
+              p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
+              p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches}
 
 
 # --- driver ---------------------------------------------------------------

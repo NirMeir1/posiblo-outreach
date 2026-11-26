@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-httpserver",
 ]
 
 [tool.setuptools.packages.find]

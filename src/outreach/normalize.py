@@ -137,6 +137,30 @@ def normalize_url(raw: object) -> NormalizedUrl:
     return _platform_key(platform, registrable, host, parts.path, parts.query)
 
 
+def registrable_domain(host: str) -> str:
+    """eTLD+1 of a host, for same-site checks (redirects, form actions).
+
+    IP addresses and hosts without a public suffix (e.g. localhost) are their
+    own "registrable domain", so they only match themselves.
+    """
+    h = (host or "").strip().rstrip(".").lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    try:
+        ipaddress.ip_address(h)
+        return h
+    except ValueError:
+        pass
+    try:
+        h = h.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return h
+    ext = _EXTRACT(h)
+    if not ext.suffix or not ext.domain:
+        return h
+    return f"{ext.domain}.{ext.suffix}"
+
+
 def _ascii_host(host: str) -> str:
     host = host.strip().rstrip(".").lower()
     if not host:

@@ -66,6 +66,16 @@ def _block_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
 
 
+@pytest.fixture(scope="session")
+def httpserver_listen_address() -> tuple[str, int]:
+    """pytest-httpserver listens on 127.0.0.1 only (IPv4 loopback).
+
+    With the default "localhost", clients try ::1 first and Windows spends
+    about 2 s retrying the refused IPv6 connection on every request.
+    """
+    return ("127.0.0.1", 0)
+
+
 REPO = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

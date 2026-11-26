@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>צרו קשר</title>
+<script src="https://www.google.com/recaptcha/api.js" async defer></script></head>
+<body>
+<h1>צרו קשר</h1>
+<form action="/send.php" method="post">
+  <label>שם <input type="text" name="name" required></label>
+  <label>דוא"ל <input type="email" name="email" required></label>
+  <label>הודעה <textarea name="message" required></textarea></label>
+  <div class="g-recaptcha" data-sitekey="6LcTESTKEY000000000000000000000000000000"></div>
+  <button type="submit">שלח</button>
+</form>
+</body>
+</html>

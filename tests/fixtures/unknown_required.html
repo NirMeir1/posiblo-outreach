@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>צור קשר</title></head>
+<body>
+<h1>צור קשר</h1>
+<form action="/contact" method="post">
+  <label for="n">שם</label><input id="n" type="text" name="name" required>
+  <label for="e">אימייל</label><input id="e" type="email" name="email" required>
+  <label for="tz">תעודת זהות *</label><input id="tz" type="text" name="id_number">
+  <label for="b">סניף</label>
+  <select id="b" name="branch" required><option value="">בחר</option><option>תל אביב</option></select>
+  <label for="m">הודעה</label><textarea id="m" name="message"></textarea>
+  <button type="submit">שלח</button>
+</form>
+</body>
+</html>
