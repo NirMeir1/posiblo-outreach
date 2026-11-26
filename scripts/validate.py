@@ -3,13 +3,15 @@
 Usage:
     python scripts/validate.py --step N        # "Always" checks + section for step N
     python scripts/validate.py --step N --log  # same, and record the result in docs/validation-log.md
-    python scripts/validate.py --all           # "Always" checks + every implemented step section
+    python scripts/validate.py --all           # "Always" + the latest step's section + the
+                                               # checks of earlier steps that must stay true
 
 Each check prints PASS, FAIL or MANUAL (MANUAL = needs a human/assistant to
 look at the listed evidence). Exit code is 1 if any check FAILs.
 
 Run it with the project's virtualenv interpreter so that A1 can run pytest,
-e.g. `.venv\\Scripts\\python scripts/validate.py --step 0`.
+e.g. `.venv\\Scripts\\python scripts/validate.py --step 0`. Project code is
+only ever run in a subprocess, so this script itself needs only the stdlib.
 """
 
 from __future__ import annotations
@@ -18,10 +20,15 @@ import argparse
 import ast
 import datetime as _dt
 import importlib.metadata
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 import tomllib
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -32,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 0
+LATEST_IMPLEMENTED_STEP = 1
 
 # --- reference data -------------------------------------------------------
 
@@ -134,8 +141,27 @@ def _previous_test_count(step: int) -> tuple[int | None, int | None]:
     return best
 
 
+def _junit_outcomes(xml_path: Path) -> dict[str, str]:
+    """Map 'tests/file.py::test_name[param]' -> passed/failed/error/skipped."""
+    out: dict[str, str] = {}
+    if not xml_path.exists():
+        return out
+    for case in ET.parse(xml_path).getroot().iter("testcase"):
+        mod = case.get("classname", "").replace(".", "/")
+        name = f"{mod}.py::{case.get('name')}"
+        outcome = "passed"
+        for child in case:
+            if child.tag in ("failure", "error", "skipped"):
+                outcome = {"failure": "failed"}.get(child.tag, child.tag)
+        out[name] = outcome
+    return out
+
+
 def check_a1(step: int, state: dict) -> Result:
-    proc = _run([sys.executable, "-m", "pytest", "-q", "-rsx"])
+    with tempfile.TemporaryDirectory() as td:
+        xml = Path(td) / "junit.xml"
+        proc = _run([sys.executable, "-m", "pytest", "-q", "-rsx", f"--junitxml={xml}"])
+        state["junit"] = _junit_outcomes(xml)
     tail = [l for l in proc.stdout.splitlines() if l.strip()][-3:]
     summary = tail[-1] if tail else "(no output)"
     passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", summary)) else 0
@@ -288,6 +314,26 @@ def check_a5(step: int, state: dict) -> Result:
         ev.append("no test imports a network client; nothing can contact a website")
         return Result("A5", "PASS", ev)
     ev += users
+    # Runtime guard: tests/conftest.py blocks every non-loopback connect/DNS lookup.
+    conftest = TESTS / "conftest.py"
+    guard = conftest.exists() and all(s in conftest.read_text(encoding="utf-8-sig") for s in
+                                      ("autouse=True", "_block_real_network", "getaddrinfo", "connect_ex"))
+    junit = state.get("junit", {})
+    guard_tests = {k: v for k, v in junit.items() if k.startswith("tests/test_network_guard.py::")}
+    guard_ok = guard and len(guard_tests) >= 3 and all(v == "passed" for v in guard_tests.values())
+    ev.append(f"tests/conftest.py autouse guard (connect, connect_ex, getaddrinfo -> loopback only): "
+              f"{'present' if guard else 'MISSING'}")
+    ev.append(f"guard self-tests: {guard_tests or 'none found'}")
+    subproc = []
+    for p in _py_files(TESTS):
+        txt = p.read_text(encoding="utf-8-sig")
+        for i, line in enumerate(txt.splitlines(), 1):
+            if re.search(r"\b(subprocess\.run|ctx\.Process|mp\.Process|Popen)\(", line):
+                subproc.append(f"{_rel(p)}:{i}: {line.strip()[:80]}")
+    if guard_ok:
+        ev.append("in-process network use is limited to loopback by the guard")
+        ev += [f"runs outside the guard (review by hand): {s}" for s in subproc] or ["no subprocess-based tests"]
+        return Result("A5", "PASS", ev)
     ev.append("review: confirm every request in these files targets 127.0.0.1/localhost")
     return Result("A5", "MANUAL", ev)
 
@@ -405,9 +451,294 @@ def p0_script(step: int, state: dict) -> Result:
                                    f"(stdlib only: see imports)"])
 
 
+# --- helpers for running project code (always in a subprocess) -------------
+
+def _run_project_code(code: str, cwd: Path = ROOT, src: Path = SRC, timeout: int = 120) -> subprocess.CompletedProcess:
+    env = dict(os.environ, PYTHONPATH=str(src), PYTHONIOENCODING="utf-8")
+    return subprocess.run([sys.executable, "-c", textwrap.dedent(code)], cwd=cwd, env=env,
+                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout)
+
+
+def _function_source(path: Path, qualname: str) -> tuple[str, int, int] | None:
+    """Return (source, first_line, last_line) of Class.method or function."""
+    text = path.read_text(encoding="utf-8-sig")
+    tree = ast.parse(text)
+    parts = qualname.split(".")
+    nodes = tree.body
+    found = None
+    for part in parts:
+        found = next((n for n in nodes if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                      and n.name == part), None)
+        if found is None:
+            return None
+        nodes = found.body
+    seg = ast.get_source_segment(text, found)
+    return seg, found.lineno, found.end_lineno
+
+
+def _sql_strings(path: Path) -> list[tuple[int, str, str]]:
+    """All string constants in a file as (line, enclosing function, text)."""
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    out: list[tuple[int, str, str]] = []
+
+    def visit(node: ast.AST, func: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = func
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = child.name
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                out.append((child.lineno, func, child.value))
+            elif isinstance(child, ast.JoinedStr):
+                txt = "".join(v.value for v in child.values
+                              if isinstance(v, ast.Constant) and isinstance(v.value, str))
+                out.append((child.lineno, func, txt))
+                continue
+            visit(child, name)
+
+    visit(tree, "<module>")
+    return out
+
+
+def _test_names(prefix: str, state: dict) -> dict[str, str]:
+    return {k: v for k, v in state.get("junit", {}).items() if k.startswith(prefix)}
+
+
+@dataclass
+class Mutation:
+    label: str
+    file: str
+    old: str
+    new: str
+
+
+def _run_mutation(m: Mutation) -> tuple[bool, list[str]]:
+    """Apply one mutation in a temporary copy of the repo and run pytest there.
+
+    Returns (caught, evidence). caught = at least one test failed.
+    The temporary copy is deleted afterwards (evidence says so).
+    """
+    ev: list[str] = []
+    tmp = Path(tempfile.mkdtemp(prefix="outreach-mutation-"))
+    copy = tmp / "repo"
+    try:
+        shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns(
+            ".git", ".venv", "__pycache__", ".pytest_cache", "*.egg-info", "data", "backups", "logs", "reports"))
+        target = copy / m.file
+        text = target.read_text(encoding="utf-8")
+        count = text.count(m.old)
+        if count != 1:
+            return False, [f"{m.label}: mutation text found {count} times in {m.file} (expected 1); not applied"]
+        target.write_text(text.replace(m.old, m.new), encoding="utf-8")
+        which = _run_project_code("import outreach, sys; print(outreach.__file__)", cwd=copy, src=copy / "src")
+        imported = which.stdout.strip()
+        if not imported.startswith(str(copy)):
+            return False, [f"{m.label}: copy imported the wrong package: {imported or which.stderr[-200:]}"]
+        env = dict(os.environ, PYTHONPATH=str(copy / "src"))
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"],
+                              cwd=copy, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=600)
+        failed = [l for l in proc.stdout.splitlines() if l.startswith(("FAILED", "ERROR"))]
+        summary = [l for l in proc.stdout.splitlines() if l.strip()][-1:] or ["(no output)"]
+        caught = proc.returncode not in (0, 5) and bool(failed)
+        ev.append(f"{m.label}: {m.file}: {m.old.strip()[:60]!r} -> {m.new.strip()[:60]!r}")
+        ev.append(f"  package under test: {imported}")
+        ev.append(f"  pytest -x: {summary[0].strip()}")
+        ev += [f"  {l[:150]}" for l in failed[:3]]
+        return caught, ev
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        ev.append(f"  temporary copy {tmp} deleted: {not tmp.exists()}")
+
+
+# --- After Prompt 1 -------------------------------------------------------
+
+def p1_normalizer(step: int, state: dict) -> Result:
+    tests = TESTS / "test_normalize.py"
+    text = tests.read_text(encoding="utf-8-sig")
+    junit = state.get("junit", {})
+    valid = {k: v for k, v in junit.items() if "::test_normalize_valid[" in k}
+    invalid = {k: v for k, v in junit.items() if "::test_normalize_invalid[" in k}
+    table_ok = len(valid) + len(invalid) >= 30 and all(v == "passed" for v in {**valid, **invalid}.values())
+    needles = {"Hebrew characters": bool(re.search("[֐-׿]", text)), "punycode (xn--)": "xn--" in text,
+               ".co.il": ".co.il" in text, "facebook": "facebook.com" in text, "instagram": "instagram.com" in text,
+               "linktr.ee": "linktr.ee" in text, "wixsite": "wixsite.com" in text, "blogspot": "blogspot.com" in text,
+               "invalid input table": "INVALID" in text}
+    # Independent behavioural spot-checks, run against the real code.
+    probe = _run_project_code("""
+        from outreach.normalize import normalize_url as n
+        k = lambda u: n(u).site_key
+        base = k("https://example.co.il")
+        checks = {
+          "www. does not change key": k("https://www.example.co.il") == base,
+          "trailing dot does not change key": k("https://example.co.il.") == base,
+          "port does not change key": k("https://example.co.il:8443") == base,
+          "tracking params do not change key": k("https://example.co.il/?utm_source=x&fbclid=y&gclid=z") == base,
+          "fragment does not change key": k("https://example.co.il/#contact") == base,
+          "www/bare/shop share one key": len({k("www.example.co.il"), k("example.co.il"), k("shop.example.co.il")}) == 1,
+          "two facebook pages differ": k("https://facebook.com/biz-a") != k("https://facebook.com/biz-b"),
+          "Hebrew IDN == punycode": k("https://דוגמה.co.il") == k("https://xn--6dbbec0c.co.il"),
+        }
+        for name, ok in checks.items():
+            print(("OK  " if ok else "BAD ") + name)
+        """)
+    lines = probe.stdout.splitlines()
+    probe_ok = probe.returncode == 0 and lines and all(l.startswith("OK") for l in lines)
+    ev = [f"table-driven cases: {len(valid)} valid + {len(invalid)} invalid = {len(valid) + len(invalid)} "
+          f"(all passed: {all(v == 'passed' for v in {**valid, **invalid}.values())})"]
+    ev += [f"covers {k}: {v}" for k, v in needles.items()]
+    ev += [f"probe: {l}" for l in lines] or [f"probe failed: {probe.stderr[-300:]}"]
+    ok = table_ok and all(needles.values()) and probe_ok
+    return Result("P1.1", "PASS" if ok else "FAIL", ev)
+
+
+def p1_tldextract_offline(step: int, state: dict) -> Result:
+    hits = []
+    for p in _py_files(SRC):
+        for i, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if "TLDExtract(" in line or "tldextract.extract(" in line:
+                hits.append((f"{_rel(p)}:{i}", line.strip()))
+    ok = bool(hits) and all("suffix_list_urls=()" in l for _, l in hits)
+    ev = [f"{loc}: {line}" for loc, line in hits] or ["no TLDExtract construction found"]
+    guard = _test_names("tests/test_normalize.py::test_normalizer_works_with_network_disabled_from_import", state)
+    ev.append(f"no-network subprocess test: {guard or 'not found'}")
+    ok = ok and bool(guard) and all(v == "passed" for v in guard.values())
+    return Result("P1.2", "PASS" if ok else "FAIL", ev)
+
+
+def p1_pragmas(step: int, state: dict) -> Result:
+    with tempfile.TemporaryDirectory() as td:
+        proc = _run_project_code(f"""
+            from outreach.ledger import Ledger
+            with Ledger({str(Path(td) / 'probe.db')!r}) as led:
+                print(led.pragma("journal_mode"), led.pragma("synchronous"),
+                      led.pragma("foreign_keys"), led.pragma("busy_timeout"))
+            """)
+    vals = proc.stdout.split()
+    ok = proc.returncode == 0 and vals[:2] == ["wal", "2"]
+    ev = [f"opened a fresh Ledger: journal_mode={vals[0] if vals else '?'} synchronous={vals[1] if len(vals) > 1 else '?'} "
+          f"foreign_keys={vals[2] if len(vals) > 2 else '?'} busy_timeout={vals[3] if len(vals) > 3 else '?'}"
+          if vals else f"probe failed: {proc.stderr[-300:]}"]
+    t = _test_names("tests/test_ledger.py::test_pragmas_wal_full_fk_busy", state)
+    ev.append(f"test: {t or 'not found'}")
+    return Result("P1.3", "PASS" if ok and t and all(v == 'passed' for v in t.values()) else "FAIL", ev)
+
+
+def p1_claim_code(step: int, state: dict) -> Result:
+    path = SRC / "outreach" / "ledger.py"
+    found = _function_source(path, "Ledger.claim")
+    if not found:
+        return Result("P1.4", "FAIL", ["Ledger.claim not found"])
+    src, first, last = found
+    lines = src.splitlines()
+    inserts = len(re.findall(r"\bINSERT\b", src))
+    do_nothing = "ON CONFLICT DO NOTHING" in src
+    other_writes = re.findall(r"\b(UPDATE|DELETE|REPLACE|DO UPDATE)\b", src)
+    begin = next((i for i, l in enumerate(lines) if '"BEGIN IMMEDIATE"' in l), None)
+    commit = next((i for i, l in enumerate(lines) if '"COMMIT"' in l), None)
+    ret = next((i for i, l in enumerate(lines) if l.strip().startswith("return created")), None)
+    rowcount = any("rowcount == 1" in l for l in lines)
+    ok = (inserts == 1 and do_nothing and not other_writes and begin is not None and commit is not None
+          and ret is not None and begin < commit < ret and rowcount)
+    ev = [f"{_rel(path)}:{first}-{last} Ledger.claim",
+          f"INSERT statements: {inserts}; 'ON CONFLICT DO NOTHING': {do_nothing}; other writes: {other_writes or 'none'}",
+          f"BEGIN IMMEDIATE at line {first + begin if begin is not None else '?'}, "
+          f"COMMIT at line {first + commit if commit is not None else '?'}, "
+          f"'return created' at line {first + ret if ret is not None else '?'} (commit before return: "
+          f"{commit is not None and ret is not None and commit < ret})",
+          f"result is 'rowcount == 1' (True only when this call inserted): {rowcount}"]
+    return Result("P1.4", "PASS" if ok else "FAIL", ev)
+
+
+_WRITE_STMT = re.compile(
+    r"\b(UPDATE\s+(\w+)\s+SET|DELETE\s+FROM\s+(\w+)|REPLACE\s+INTO\s+(\w+)|INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)"
+    r"|DO\s+UPDATE|DROP\s+(?:TABLE|TRIGGER|INDEX)\b[^;]*)", re.I)
+_TRIGGER = re.compile(r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+BEFORE\s+(UPDATE|DELETE)\s+ON\s+(\w+)"
+                      r"(.*?)\bEND\b", re.I | re.S)
+
+
+def p1_update_delete_scan(step: int, state: dict) -> Result:
+    """Every SQL statement in src/ that can modify or remove an existing row."""
+    ev, bad = [], []
+    for p in _py_files(SRC):
+        for line, func, text in _sql_strings(p):
+            flat = " ".join(text.split())
+            for t in _TRIGGER.finditer(flat):
+                body_writes = _WRITE_STMT.findall(t.group(4))
+                verdict = ("protective trigger: body only RAISEs" if "RAISE(ABORT" in t.group(4) and not body_writes
+                           else "TRIGGER WITH WRITES")
+                if body_writes:
+                    bad.append(f"{_rel(p)}:{line}")
+                ev.append(f"{_rel(p)}:{line}: trigger {t.group(1)} BEFORE {t.group(2).upper()} ON {t.group(3)} -> {verdict}")
+            for m in _WRITE_STMT.finditer(_TRIGGER.sub(" ", flat)):
+                stmt = " ".join(m.group(0).split()[:3]).upper()
+                table = next((g for g in m.groups()[1:] if g), "?")
+                fin = re.fullmatch(r"\s*UPDATE sites SET (.*) WHERE site_key = \? AND status = 'pending'\s*", flat)
+                if stmt.startswith("UPDATE") and table == "sites" and func == "finish" \
+                        and fin and "pending" not in fin.group(1):
+                    verdict = "allowed: finish() moves a pending row to a final status"
+                elif table not in ("sites", "?"):
+                    verdict = f"writes table {table} (not sites)"
+                else:
+                    verdict = "NOT ALLOWED (modifies or removes site rows / schema)"
+                    bad.append(f"{_rel(p)}:{line}")
+                ev.append(f"{_rel(p)}:{line} in {func}(): {flat[:90]!r} -> {verdict}")
+    ev = ev or ["no UPDATE/DELETE statements in src/"]
+    return Result("P1.5", "FAIL" if bad else "PASS", ev)
+
+
+P1_REQUIRED_TESTS = {
+    "second claim returns False": "tests/test_ledger.py::test_second_claim_of_same_key_returns_false",
+    "different URL spellings return False": "tests/test_ledger.py::test_claim_via_different_url_spellings_returns_false",
+    "concurrent claim (threads)": "tests/test_ledger.py::test_concurrent_claims_threads_exactly_one_winner",
+    "concurrent claim (processes)": "tests/test_ledger.py::test_concurrent_claims_processes_exactly_one_winner",
+    "crash after claim stays pending, not re-offered":
+        "tests/test_ledger.py::test_crash_after_claim_leaves_row_pending_and_not_offered_again",
+    "suppression blocks a domain": "tests/test_ledger.py::test_suppressed_domain_is_blocked_for_any_spelling",
+}
+
+
+def p1_required_tests(step: int, state: dict) -> Result:
+    junit = state.get("junit", {})
+    ev, ok = [], True
+    for label, name in P1_REQUIRED_TESTS.items():
+        outcome = junit.get(name, "MISSING")
+        ok &= outcome == "passed"
+        ev.append(f"{label}: {name} -> {outcome}")
+    text = (TESTS / "test_ledger.py").read_text(encoding="utf-8-sig")
+    sizes = re.findall(r"workers, rounds = (\d+), (\d+)", text)
+    ev.append(f"concurrency sizes (workers, rounds): {sizes}")
+    ok &= len(sizes) >= 2 and all(int(w) >= 8 and int(r) >= 2 for w, r in sizes)
+    return Result("P1.6", "PASS" if ok else "FAIL", ev)
+
+
+P1_MUTATIONS = [
+    Mutation("claim() always returns True", "src/outreach/ledger.py",
+             "            created = cur.rowcount == 1\n",
+             "            created = True\n"),
+    Mutation("claim() without COMMIT", "src/outreach/ledger.py",
+             "            created = cur.rowcount == 1\n            conn.execute(\"COMMIT\")\n",
+             "            created = cur.rowcount == 1\n"),
+]
+
+
+def p1_mutations(step: int, state: dict) -> Result:
+    ev, ok = [], True
+    for m in P1_MUTATIONS:
+        caught, mev = _run_mutation(m)
+        ok &= caught
+        ev += mev + [f"  -> {'CAUGHT (a test failed)' if caught else 'NOT CAUGHT'}"]
+    return Result("P1.7", "PASS" if ok else "FAIL", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
+    1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
+        p1_required_tests, p1_mutations],
 }
+# Checks from earlier steps that must stay true at every later step (used by --all).
+PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
+              p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations}
 
 
 # --- driver ---------------------------------------------------------------
@@ -436,12 +767,13 @@ def main() -> int:
     if step not in STEPS:
         print(f"step {step} has no checks implemented yet (latest: {LATEST_IMPLEMENTED_STEP})")
         return 2
-    sections = sorted(STEPS) if args.all else [step]
-
     state: dict = {}
     results = [c(step, state) for c in ALWAYS]
-    for s in sections:
-        results += [c(step, state) for c in STEPS[s]]
+    if args.all:
+        for s in sorted(STEPS):
+            results += [c(step, state) for c in STEPS[s] if s == step or c in PERSISTENT]
+    else:
+        results += [c(step, state) for c in STEPS[step]]
 
     for r in results:
         print(f"[{r.status:6}] {r.cid}")
