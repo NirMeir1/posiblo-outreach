@@ -6,7 +6,9 @@ Send-once guarantees implemented here:
   COMMIT. It returns True only if this call created the row, and only after
   the COMMIT returned (WAL + synchronous=FULL: the commit is fsynced).
 - finish() is the only code that changes a site row, and only moves a
-  `pending` row to a final status.
+  `pending` row to a final status. reopen() is the only code that removes
+  one, and only for statuses where no POST ever happened
+  (REOPENABLE_STATUSES).
 - Triggers refuse, at the database level, to delete rows whose status means a
   POST may have happened (pending, sent, sent_unconfirmed) or opted_out rows;
   to move any row back to pending; to change a sent/sent_unconfirmed row to
@@ -32,6 +34,11 @@ STATUSES = (
 )
 FINAL_STATUSES = tuple(s for s in STATUSES if s != "pending")
 SUPPRESSION_KINDS = ("domain", "email", "phone")
+# Statuses where no POST was ever made: the only ones `reopen` may remove.
+REOPENABLE_STATUSES = ("no_form", "captcha", "login_required", "robots_blocked", "unclear_fields")
+BATCH_STATES = ("planned", "dry_run_done", "approved", "sending", "send_done")
+OPEN_BATCH_STATES = ("planned", "dry_run_done", "approved", "sending")
+SENDABLE_BATCH_STATES = ("approved", "sending", "send_done")
 
 _STATUS_SQL = ", ".join(f"'{s}'" for s in STATUSES)
 _KIND_SQL = ", ".join(f"'{k}'" for k in SUPPRESSION_KINDS)
@@ -295,8 +302,15 @@ class Ledger:
 
     # -- batches ----------------------------------------------------------
     def is_planned(self, site_key: str) -> bool:
-        """True if the site is already part of any batch."""
-        row = self._conn.execute("SELECT 1 FROM batch_sites WHERE site_key = ? LIMIT 1", (site_key,)).fetchone()
+        """True if the site is part of a batch that is still open (not yet sent).
+
+        A site of a finished batch that was never claimed (e.g. a network error
+        before the claim) is eligible for a future batch.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM batch_sites s JOIN batches b ON b.batch_id = s.batch_id "
+            f"WHERE s.site_key = ? AND b.state IN ({', '.join(repr(s) for s in OPEN_BATCH_STATES)}) LIMIT 1",
+            (site_key,)).fetchone()
         return row is not None
 
     def create_batches(self, groups: list[list[dict[str, Any]]], source_file: str | None = None) -> list[str]:
@@ -414,6 +428,48 @@ class Ledger:
                 conn.execute("ROLLBACK")
             raise
         return count
+
+    # -- live run -----------------------------------------------------------
+    def begin_send(self, batch_id: str) -> None:
+        cur = self._conn.execute(
+            f"UPDATE batches SET state = 'sending' WHERE batch_id = ? AND state IN "
+            f"({', '.join(repr(s) for s in SENDABLE_BATCH_STATES)})", (batch_id,))
+        if cur.rowcount != 1:
+            raise LedgerError(f"batch {batch_id} is not approved")
+
+    def finish_send(self, batch_id: str) -> None:
+        self._conn.execute("UPDATE batches SET state = 'send_done' WHERE batch_id = ? AND state = 'sending'",
+                           (batch_id,))
+
+    # -- reopen -----------------------------------------------------------
+    def reopen(self, site_key: str) -> str:
+        """Remove a site row whose status means no POST ever happened, so the site can be planned again.
+
+        Refused for every other status (pending, sent, sent_unconfirmed, opted_out, ...). Returns the
+        removed status. The sites_protect_delete trigger independently refuses pending/sent rows.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT status FROM sites WHERE site_key = ?", (site_key,)).fetchone()
+            if row is None:
+                raise LedgerError(f"no site {site_key!r} in the ledger")
+            if row[0] not in REOPENABLE_STATUSES:
+                raise LedgerError(f"site {site_key} is {row[0]}; reopen is only allowed for "
+                                  f"{', '.join(REOPENABLE_STATUSES)}")
+            cur = conn.execute(
+                "DELETE FROM sites WHERE site_key = ? AND status IN "
+                "('no_form', 'captcha', 'login_required', 'robots_blocked', 'unclear_fields')", (site_key,))
+            if cur.rowcount != 1:
+                raise LedgerError(f"reopen({site_key!r}) removed {cur.rowcount} rows")
+            conn.execute("INSERT INTO events (ts, site_key, level, message) VALUES (?, ?, 'warning', ?)",
+                         (_now(), site_key, f"reopened by operator (was {row[0]})"))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return row[0]
 
     def approved_sites(self, batch_id: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self._conn.execute(

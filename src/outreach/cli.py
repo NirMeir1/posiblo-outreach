@@ -20,6 +20,8 @@ from .ledger import SUPPRESSION_KINDS, Ledger, LedgerError, open_readonly, statu
 from .message import MessageError
 from .normalize import InvalidUrl
 from .preflight import run_preflight
+from .reopen import ReopenRefused, reopen_site
+from .send import SendRefused, live_allowed, run_send
 
 REPORTS_DIRNAME = "reports"
 
@@ -156,6 +158,37 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_send(args: argparse.Namespace) -> int:
+    import os
+    # First thing, before reading config or opening anything: the ALLOW_LIVE gate.
+    if not live_allowed(os.environ):
+        print("Live sending is disabled (ALLOW_LIVE is not set to 1). Nothing was sent.", file=sys.stderr)
+        return 1
+    config = load_config()
+    with Ledger(config.ledger_path) as led:
+        try:
+            report = run_send(config, led, args.batch_id, environ=os.environ)
+        except SendRefused as e:
+            print(f"send refused: {e}", file=sys.stderr)
+            return 1
+    return 1 if report.halted_reason else 0
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    config = load_config()
+    failures = run_preflight(config, live=False, require_no_stop=False)
+    if failures:
+        _print_failures(failures)
+        return 1
+    with Ledger(config.ledger_path) as led:
+        try:
+            reopen_site(led, args.site_key)
+        except ReopenRefused as e:
+            print(f"reopen: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m outreach",
                                 description="Posiblo outreach: one consent-request message per site, sent once.")
@@ -191,6 +224,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("export", help="write reports/<batch_id>-<timestamp>.csv (never overwrites)")
     sp.add_argument("batch_id")
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("send", help="LIVE: send the approved batch (requires ALLOW_LIVE=1; disabled by default)")
+    sp.add_argument("batch_id")
+    sp.set_defaults(func=cmd_send)
+
+    sp = sub.add_parser("reopen", help="make a site plannable again after no_form/captcha/login/robots/unclear")
+    sp.add_argument("site_key")
+    sp.set_defaults(func=cmd_reopen)
     return p
 
 

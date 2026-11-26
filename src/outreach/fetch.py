@@ -166,6 +166,11 @@ class Fetcher:
         with self._lock:
             return self._robots_policy(url).allows(url)
 
+    def wait_turn(self, url: str) -> None:
+        """Apply the per-host delay for a request made by another client (the single POST in send.py)."""
+        with self._lock:
+            self._wait_for_host(url)
+
     # -- internals -----------------------------------------------------------
     def _get(self, url: str) -> FetchResult:
         current = url

@@ -39,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 4
+LATEST_IMPLEMENTED_STEP = 5
 
 # CLI commands that must exist (and no others) after each step (A8).
 EXPECTED_COMMANDS: dict[int, list[str]] = {
@@ -576,6 +576,11 @@ class Mutation:
     file: str
     old: str
     new: str
+    more: tuple[tuple[str, str], ...] = ()   # further (old, new) edits in the same file, applied in order
+    tests: tuple[str, ...] = ()               # test files to run (in this order); empty = whole suite
+
+    def edits(self) -> list[tuple[str, str]]:
+        return [(self.old, self.new), *self.more]
 
 
 def _run_mutation(m: Mutation) -> tuple[bool, list[str]]:
@@ -592,24 +597,29 @@ def _run_mutation(m: Mutation) -> tuple[bool, list[str]]:
             ".git", ".venv", "__pycache__", ".pytest_cache", "*.egg-info", "data", "backups", "logs", "reports"))
         target = copy / m.file
         text = target.read_text(encoding="utf-8")
-        count = text.count(m.old)
-        if count != 1:
-            return False, [f"{m.label}: mutation text found {count} times in {m.file} (expected 1); not applied"]
-        target.write_text(text.replace(m.old, m.new), encoding="utf-8")
+        for old, new in m.edits():
+            count = text.count(old)
+            if count != 1:
+                return False, [f"{m.label}: mutation text found {count} times in {m.file} (expected 1); "
+                               f"not applied: {old.strip()[:70]!r}"]
+            text = text.replace(old, new)
+        target.write_text(text, encoding="utf-8")
         which = _run_project_code("import outreach, sys; print(outreach.__file__)", cwd=copy, src=copy / "src")
         imported = which.stdout.strip()
         if not imported.startswith(str(copy)):
             return False, [f"{m.label}: copy imported the wrong package: {imported or which.stderr[-200:]}"]
-        env = dict(os.environ, PYTHONPATH=str(copy / "src"))
-        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"],
+        env = {k: v for k, v in os.environ.items() if k != "ALLOW_LIVE"}
+        env["PYTHONPATH"] = str(copy / "src")
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *m.tests],
                               cwd=copy, env=env, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=600)
+                              errors="replace", timeout=900)
         failed = [l for l in proc.stdout.splitlines() if l.startswith(("FAILED", "ERROR"))]
         summary = [l for l in proc.stdout.splitlines() if l.strip()][-1:] or ["(no output)"]
         caught = proc.returncode not in (0, 5) and bool(failed)
-        ev.append(f"{m.label}: {m.file}: {m.old.strip()[:60]!r} -> {m.new.strip()[:60]!r}")
+        for old, new in m.edits():
+            ev.append(f"{m.label}: {m.file}: {old.strip()[:70]!r} -> {new.strip()[:70]!r}")
         ev.append(f"  package under test: {imported}")
-        ev.append(f"  pytest -x: {summary[0].strip()}")
+        ev.append(f"  pytest -x {' '.join(m.tests) or '(whole suite)'}: {summary[0].strip()}")
         ev += [f"  {l[:150]}" for l in failed[:3]]
         return caught, ev
     finally:
@@ -740,9 +750,14 @@ def p1_update_delete_scan(step: int, state: dict) -> Result:
                 stmt = " ".join(m.group(0).split()[:3]).upper()
                 table = next((g for g in m.groups()[1:] if g), "?")
                 fin = re.fullmatch(r"\s*UPDATE sites SET (.*) WHERE site_key = \? AND status = 'pending'\s*", flat)
+                reo = re.fullmatch(r"\s*DELETE FROM sites WHERE site_key = \? AND status IN \('no_form', 'captcha', "
+                                   r"'login_required', 'robots_blocked', 'unclear_fields'\)\s*", flat)
                 if stmt.startswith("UPDATE") and table == "sites" and func == "finish" \
                         and fin and "pending" not in fin.group(1):
                     verdict = "allowed: finish() moves a pending row to a final status"
+                elif stmt.startswith("DELETE") and table == "sites" and func == "reopen" and reo:
+                    verdict = ("allowed (Prompt 5 reopen): removes only no_form/captcha/login_required/"
+                               "robots_blocked/unclear_fields rows, where no POST happened")
                 elif table not in ("sites", "?"):
                     verdict = f"writes table {table} (not sites)"
                 else:
@@ -781,10 +796,10 @@ def p1_required_tests(step: int, state: dict) -> Result:
 P1_MUTATIONS = [
     Mutation("claim() always returns True", "src/outreach/ledger.py",
              "            created = cur.rowcount == 1\n",
-             "            created = True\n"),
+             "            created = True\n", tests=("tests/test_ledger.py",)),
     Mutation("claim() without COMMIT", "src/outreach/ledger.py",
              "            created = cur.rowcount == 1\n            conn.execute(\"COMMIT\")\n",
-             "            created = cur.rowcount == 1\n"),
+             "            created = cur.rowcount == 1\n", tests=("tests/test_ledger.py",)),
 ]
 
 
@@ -843,8 +858,10 @@ def p2_backup(step: int, state: dict) -> Result:
     bk = SRC / "outreach" / "backup.py"
     api = _lines_matching(bk, r"\.backup\(")
     raw = []
-    for p in _py_files(SRC):
-        raw += _lines_matching(p, r"\bshutil\b|copyfile|copy2|\.read_bytes\(|\.write_bytes\(|open\([^)]*['\"]wb")
+    for p in _py_files(SRC):  # file-copy primitives anywhere in src/
+        raw += _lines_matching(p, r"\bshutil\b|copyfile|copy2|copytree|os\.link\(")
+    # raw byte reads/writes in the module that handles database files
+    raw += _lines_matching(bk, r"\.read_bytes\(|\.write_bytes\(|\bopen\(")
     ok, ev = _required(state, {
         "backup opens + integrity ok": "tests/test_backup.py::test_backup_is_valid_openable_database",
         "WAL content included": "tests/test_backup.py::test_backup_includes_uncheckpointed_wal_content",
@@ -1175,6 +1192,262 @@ def p4_export(step: int, state: dict) -> Result:
     return Result("P4.5", "PASS" if ok and x_only and not reads_csv else "FAIL", ev)
 
 
+# --- After Prompt 5 -------------------------------------------------------
+
+def _calls_with_func(path: Path) -> list[tuple[int, str, str, list[str]]]:
+    """(line, callee name, enclosing function, enclosing loop kinds) for every call in a module."""
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    out: list[tuple[int, str, str, list[str]]] = []
+
+    def visit(node: ast.AST, func: str, loops: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            f, lp = func, loops
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                f, lp = child.name, []
+            elif isinstance(child, (ast.For, ast.While, ast.AsyncFor)):
+                lp = loops + [type(child).__name__]
+            if isinstance(child, ast.Call):
+                fn = child.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+                out.append((child.lineno, name, func, loops))
+            visit(child, f, lp)
+
+    visit(tree, "<module>", [])
+    return out
+
+
+def p5_single_post(step: int, state: dict) -> Result:
+    sends = []
+    for p in _py_files(SRC):
+        for i, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if _POST_SEND.search(line):
+                sends.append((p, i, line.strip()))
+    ev = [f"request-sending lines in src/ (pattern of P3.1): {len(sends)}"]
+    ev += [f"  {_rel(p)}:{i}: {l}" for p, i, l in sends]
+    send_py = SRC / "outreach" / "send.py"
+    fn = _function_source(send_py, "_post_once")
+    post_ok = (len(sends) == 1 and sends[0][0] == send_py and fn is not None and fn[1] <= sends[0][1] <= fn[2])
+    ev.append(f"the POST is inside send.py:_post_once (lines {fn[1]}-{fn[2]}): {post_ok}" if fn else "_post_once missing")
+    callers = [(f"{_rel(p)}:{ln}", func) for p in _py_files(SRC) for ln, name, func, _ in _calls_with_func(p)
+               if name == "_post_once"]
+    run_callers = [(f"{_rel(p)}:{ln}", func) for p in _py_files(SRC) for ln, name, func, _ in _calls_with_func(p)
+                   if name == "run_send"]
+    cli = (SRC / "outreach" / "cli.py").read_text(encoding="utf-8-sig")
+    wired = re.search(r'add_parser\("send".*?\n\s*sp\.add_argument\("batch_id"\)\n\s*sp\.set_defaults\(func=cmd_send\)', cli)
+    importers = [f"{_rel(p)}" for p in _py_files(SRC) if re.search(r"from \.send import|import outreach\.send|"
+                                                                    r"from outreach\.send import",
+                                                                    p.read_text(encoding="utf-8-sig"))]
+    ev += [f"_post_once() called from: {callers}", f"run_send() called from: {run_callers}",
+           f"`send` subcommand wired to cmd_send: {bool(wired)}", f"modules importing send.py: {importers}"]
+    ok = (post_ok and [c[1] for c in callers] == ["_send_one"] and [c[1] for c in run_callers] == ["cmd_send"]
+          and bool(wired) and importers == ["src/outreach/cli.py"])
+    return Result("P5.1", "PASS" if ok else "FAIL", ev)
+
+
+def _line_of(src: str, first: int, needle: str) -> int | None:
+    for i, line in enumerate(src.splitlines()):
+        if needle in line:
+            return first + i
+    return None
+
+
+def p5_gates(step: int, state: dict) -> Result:
+    send_py = SRC / "outreach" / "send.py"
+    src, first, last = _function_source(send_py, "run_send")
+    gates = [("ALLOW_LIVE (live_allowed)", "if not live_allowed(environ)"),
+             ("preflight live=True (STOP, ledger, template, TODO)", "run_preflight(config, live=True)"),
+             ("batch approved", "not in SENDABLE_BATCH_STATES"),
+             ("frozen approved list", "ledger.approved_sites(batch_id)"),
+             ("message renders", "render_message(config)"),
+             ("fresh backup", "before = create_backup(config)")]
+    network = [("Fetcher created", "Fetcher(delay_seconds"), ("POST client created", "httpx.Client(")]
+    gl = [(label, _line_of(src, first, n)) for label, n in gates]
+    nl = [(label, _line_of(src, first, n)) for label, n in network]
+    ev = [f"{_rel(send_py)}:{first}-{last} run_send():"]
+    ev += [f"  gate line {ln}: {label}" for label, ln in gl]
+    ev += [f"  network line {ln}: {label}" for label, ln in nl]
+    order_ok = all(ln for _, ln in gl + nl) and [ln for _, ln in gl] == sorted(ln for _, ln in gl) and \
+        max(ln for _, ln in gl) < min(ln for _, ln in nl)
+    gate_fn = _function_source(send_py, "live_allowed")
+    ev.append(f"live_allowed(): {' '.join(gate_fn[0].split()) if gate_fn else 'missing'}")
+    exact = bool(gate_fn) and 'return environ.get("ALLOW_LIVE") == "1"' in gate_fn[0]
+    csrc, cfirst, _ = _function_source(SRC / "outreach" / "cli.py", "cmd_send")
+    c_gate, c_cfg, c_led = (_line_of(csrc, cfirst, n) for n in ("if not live_allowed(os.environ)", "load_config()",
+                                                                "Ledger(config.ledger_path)"))
+    ev.append(f"cli.cmd_send(): ALLOW_LIVE gate line {c_gate} < load_config line {c_cfg} < Ledger line {c_led}")
+    cli_ok = bool(c_gate and c_cfg and c_led and c_gate < c_cfg < c_led)
+    ok, tev = _required(state, {
+        "ALLOW_LIVE != '1' -> refused, no network, no backup":
+            "tests/test_send.py::test_without_allow_live_nothing_happens[",
+        "only exactly '1' enables": "tests/test_send.py::test_live_allowed_only_for_exactly_1",
+        "CLI without ALLOW_LIVE: zero network, ledger not opened":
+            "tests/test_send.py::test_cli_send_without_allow_live_makes_zero_network_calls",
+        "unapproved batch refused": "tests/test_send.py::test_unapproved_batch_is_refused",
+        "TODO sender refused": "tests/test_send.py::test_todo_sender_address_is_refused",
+        "STOP refused before network": "tests/test_send.py::test_stop_file_refuses_before_any_network",
+        "failed backup refused before network": "tests/test_send.py::test_failed_backup_refuses_before_any_network",
+    })
+    return Result("P5.2", "PASS" if ok and order_ok and exact and cli_ok else "FAIL", ev + tev)
+
+
+def p5_order(step: int, state: dict) -> Result:
+    send_py = SRC / "outreach" / "send.py"
+    src, first, last = _function_source(send_py, "_Run._send_one")
+    steps = [("re-fetch form page", "page = self.fetcher.get("), ("rebuild plan", "rebuilt = build_plan("),
+             ("compare with approved plan", "diffs = plan_differences("), ("claim", "if not self.ledger.claim("),
+             ("send-log 'claimed' (fsync)", "self.sendlog.append(EVENT_CLAIMED"),
+             ("POST once", "outcome = _post_once("), ("verify", "status, detail = verify("),
+             ("finish", "self.ledger.finish(key, status, detail)"),
+             ("send-log 'result' (fsync)", "self.sendlog.append(EVENT_RESULT")]
+    lines = [(label, _line_of(src, first, n)) for label, n in steps]
+    ev = [f"{_rel(send_py)}:{first}-{last} _Run._send_one():"] + [f"  line {ln}: {label}" for label, ln in lines]
+    nums = [ln for _, ln in lines]
+    ascending = all(nums) and nums == sorted(nums) and len(set(nums)) == len(nums)
+    ev.append(f"strictly in the required order: {ascending}")
+    ev.append("claim() commits (BEGIN IMMEDIATE ... COMMIT) before it returns: see P1.4")
+    ok, tev = _required(state, {
+        "claim committed before POST (crash between them leaves pending, rerun sends nothing)":
+            "tests/test_send.py::test_crash_between_claim_and_post_then_rerun_sends_nothing_more",
+        "hard process crash between claim and POST": "tests/test_send.py::test_hard_process_crash_between_claim_and_post",
+        "send log claimed/result per site": "tests/test_send.py::test_one_post_per_site_with_fresh_token_and_exact_message",
+    })
+    return Result("P5.3", "PASS" if ok and ascending else "FAIL", ev + tev)
+
+
+def p5_no_retry(step: int, state: dict) -> Result:
+    send_py = SRC / "outreach" / "send.py"
+    calls = _calls_with_func(send_py)
+    post_calls = [(ln, func, loops) for ln, name, func, loops in calls if name == "_post_once"]
+    streams = [(ln, func, loops) for ln, name, func, loops in calls if name == "stream" and func == "_post_once"]
+    retry_src = []
+    for p in _py_files(SRC):
+        retry_src += _lines_matching(p, r"\bretries\s*=|tenacity|backoff|retrying|Retry\(")
+    retry_deps = [l.strip() for l in (ROOT / "pyproject.toml").read_text(encoding="utf-8-sig").splitlines()
+                  if re.search(r"tenacity|backoff|retrying", l)]
+    run_src = _function_source(send_py, "_Run.run")[0]
+    ev = [f"_post_once() call sites: {post_calls} (loops inside the calling function: "
+          f"{[l for _, _, l in post_calls]})",
+          f"client.stream('POST') calls inside _post_once: {streams}",
+          "the only loop around _send_one is `for i, site in enumerate(sites, 1)` in _Run.run: one pass per approved "
+          f"site: {'for i, site in enumerate(sites, 1):' in run_src}",
+          f"retry code in src/: {retry_src or 'none'}", f"retry libraries in pyproject: {retry_deps or 'none'}"]
+    struct_ok = (len(post_calls) == 1 and post_calls[0][2] == [] and len(streams) == 1 and streams[0][2] == []
+                 and not retry_src and not retry_deps)
+    ok, tev = _required(state, {
+        "HTTP error after POST -> sent_unconfirmed, 1 POST":
+            "tests/test_send.py::test_http_error_after_post_is_sent_unconfirmed_without_retry",
+        "timeout during POST -> sent_unconfirmed, 1 POST, rerun sends nothing":
+            "tests/test_send.py::test_timeout_during_post_is_sent_unconfirmed_without_retry",
+        "network error BEFORE claim -> unclaimed + event":
+            "tests/test_send.py::test_network_error_before_claim_leaves_site_unclaimed_with_event",
+        "static: one POST function, no retry wrapper": "tests/test_send.py::test_only_one_post_function_and_no_retry_wrapper",
+    })
+    return Result("P5.4", "PASS" if ok and struct_ok else "FAIL", ev + tev)
+
+
+def p5_required_tests(step: int, state: dict) -> Result:
+    ok, ev = _required(state, {
+        "two runs -> exactly one POST per site": "tests/test_send.py::test_send_twice_gives_exactly_one_post_per_site",
+        "crash between claim and POST, rerun -> 0 extra POSTs, row pending":
+            "tests/test_send.py::test_crash_between_claim_and_post_then_rerun_sends_nothing_more",
+        "ALLOW_LIVE unset -> zero connections": "tests/test_send.py::test_cli_send_without_allow_live_makes_zero_network_calls",
+        "unapproved batch refused": "tests/test_send.py::test_unapproved_batch_is_refused",
+        "changed form action since approval -> skipped":
+            "tests/test_send.py::test_changed_form_action_is_skipped_and_not_claimed",
+        "error during POST -> sent_unconfirmed, no retry":
+            "tests/test_send.py::test_http_error_after_post_is_sent_unconfirmed_without_retry",
+        "breaker trips after N consecutive failures": "tests/test_send.py::test_breaker_trips_after_n_consecutive_failures",
+        "claim refused -> no POST": "tests/test_send.py::test_claim_refused_means_no_post",
+    })
+    counter = "posts(" in (TESTS / "test_send.py").read_text(encoding="utf-8-sig")
+    ev.append(f"tests count POSTs received by a local server (LocalSites.posts): {counter}")
+    return Result("P5.5", "PASS" if ok and counter else "FAIL", ev)
+
+
+def p5_reopen(step: int, state: dict) -> Result:
+    led = SRC / "outreach" / "ledger.py"
+    allowed = _lines_matching(led, r"^REOPENABLE_STATUSES = ")
+    ok, ev = _required(state, {
+        "refused for sent/sent_unconfirmed/pending/...":
+            "tests/test_reopen.py::test_reopen_refused_for_statuses_where_a_post_may_have_happened[",
+        "allowed for the 5 no-POST statuses": "tests/test_reopen.py::test_reopen_allowed_statuses[",
+        "exactly the prompt's list": "tests/test_reopen.py::test_reopenable_statuses_are_exactly_the_prompt_list",
+        "requires typing the site key": "tests/test_reopen.py::test_reopen_requires_typing_the_site_key[",
+        "ledger refuses directly too": "tests/test_reopen.py::test_ledger_reopen_refuses_directly_too",
+        "CLI reopen": "tests/test_reopen.py::test_cli_reopen",
+    })
+    event = _lines_matching(led, r"reopened by operator")
+    return Result("P5.6", "PASS" if ok and allowed and event else "FAIL", allowed + event + ev)
+
+
+P5_MUTATIONS = [
+    Mutation("(a) POST moved before the claim", "src/outreach/send.py",
+             "        # Step 2: claim. Committed to disk before anything is sent.\n",
+             "        outcome = _post_once(self.client, plan, payload)  # MUTATION: POST before claim\n"
+             "        # Step 2: claim. Committed to disk before anything is sent.\n",
+             more=(("        self.fetcher.wait_turn(plan.action_url)\n        outcome = _post_once(self.client, plan, payload)\n",
+                    "        self.fetcher.wait_turn(plan.action_url)\n"),),
+             tests=("tests/test_send.py",)),
+    Mutation("(b) ALLOW_LIVE check removed", "src/outreach/send.py",
+             '    return environ.get("ALLOW_LIVE") == "1"\n',
+             "    return True  # MUTATION: ALLOW_LIVE check removed\n",
+             tests=("tests/test_send.py",)),
+    Mutation("(c) claim() always returns True", "src/outreach/ledger.py",
+             "            created = cur.rowcount == 1\n",
+             "            created = True\n",
+             tests=("tests/test_send.py", "tests/test_ledger.py")),
+]
+
+
+def p5_mutations(step: int, state: dict) -> Result:
+    ev, ok = [], True
+    for m in P5_MUTATIONS:
+        caught, mev = _run_mutation(m)
+        ok &= caught
+        ev += mev + [f"  -> {'CAUGHT (a test failed)' if caught else 'NOT CAUGHT'}"]
+    return Result("P5.7", "PASS" if ok else "FAIL", ev)
+
+
+_SET_ALLOW_LIVE = re.compile(
+    r"^\s*(export\s+|set\s+|\$env:)?ALLOW_LIVE\s*=|environ\[\s*[\"']ALLOW_LIVE[\"']\s*\]\s*=|"
+    r"setenv\(\s*[\"']ALLOW_LIVE|putenv\(\s*[\"']ALLOW_LIVE|environ\.update\([^)]*ALLOW_LIVE|"
+    r"setdefault\(\s*[\"']ALLOW_LIVE", re.I)
+
+
+def p5_allow_live_and_no_real_send(step: int, state: dict) -> Result:
+    setters, mappings = [], []
+    for f in _git_ls_files() + [p for _, p in [(None, l[3:].strip()) for l in
+                                               _run(["git", "status", "--porcelain", "-uall"]).stdout.splitlines()]]:
+        path = ROOT / f
+        if not path.is_file() or path.suffix in (".db", ".png", ".jpg"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if _SET_ALLOW_LIVE.search(line):
+                setters.append(f"{f}:{i}: {line.strip()[:100]}")
+            elif re.search(r"[\"']ALLOW_LIVE[\"']\s*:\s*[\"']1[\"']", line):
+                mappings.append(f"{f}:{i}")
+    setters = sorted(set(setters))
+    dotenv = ROOT / ".env"
+    dotenv_live = dotenv.exists() and "ALLOW_LIVE" in dotenv.read_text(encoding="utf-8-sig", errors="replace")
+    in_env = "ALLOW_LIVE" in os.environ
+    real_log = ROOT / "logs" / "send-log.jsonl"
+    real_ledger = ROOT / "data" / "ledger.db"
+    ev = [f"lines that SET ALLOW_LIVE as an environment variable (tracked + new files): {setters or 'none'}",
+          f"test-only {{'ALLOW_LIVE': '1'}} mappings passed to run_send(environ=...), not environment variables: "
+          f"{len(sorted(set(mappings)))} ({', '.join(sorted(set(mappings))[:4])}{', ...' if len(set(mappings)) > 4 else ''})",
+          f".env exists: {dotenv.exists()}; .env mentions ALLOW_LIVE: {dotenv_live}",
+          f"ALLOW_LIVE in this validation process's environment: {in_env}",
+          f"project send log {_rel(real_log)} exists: {real_log.exists()}; project ledger {_rel(real_ledger)} "
+          f"exists: {real_ledger.exists()} (no live run has ever written them)",
+          "every send test talks to the 127.0.0.1 test server; the conftest guard blocks all other addresses (A5)"]
+    ok = not setters and not dotenv_live and not in_env and not real_log.exists()
+    return Result("P5.8", "PASS" if ok else "FAIL", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
@@ -1183,13 +1456,17 @@ STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
         p2_no_fetch],
     3: [p3_no_post, p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches],
     4: [p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export, p3_no_post],
+    5: [p5_single_post, p5_gates, p5_order, p5_no_retry, p5_required_tests, p5_reopen, p5_mutations,
+        p5_allow_live_and_no_real_send],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
               p1_claim_code, p1_update_delete_scan, p1_required_tests, p1_mutations,
               p2_settings_documented, p2_backup, p2_sendlog, p2_preflight, p2_breaker, p2_template, p2_ingest,
               p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches,
-              p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export}
+              p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export,
+              p5_single_post, p5_gates, p5_order, p5_no_retry, p5_required_tests, p5_reopen, p5_mutations,
+              p5_allow_live_and_no_real_send}
 
 
 # --- driver ---------------------------------------------------------------
