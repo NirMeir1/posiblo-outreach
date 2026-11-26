@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="he">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Posiblo outreach – dashboard</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5b6475; --line: #d9dde5;
+  --ok: #1b7f3b; --ok-bg: #e5f5ea; --warn: #8a5a00; --warn-bg: #fff3d6;
+  --bad: #b3261e; --bad-bg: #fde7e5; --info: #2f5aa8; --bar: #2f6fdd;
+  --font: "Segoe UI", "Noto Sans Hebrew", "Arial Hebrew", Arial, "David", Tahoma, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171d; --panel: #1c2028; --text: #e6e9ef; --muted: #a3abba; --line: #333a46;
+          --ok: #6fd391; --ok-bg: #173323; --warn: #f0c062; --warn-bg: #3a2f14;
+          --bad: #ff8a80; --bad-bg: #3d1b19; --info: #8fb4ff; --bar: #5b8cff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 var(--font); }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+         padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+main { display: grid; gap: 16px; padding: 16px 20px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+section.wide { grid-column: 1 / -1; }
+.muted { color: var(--muted); }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; font-variant-numeric: tabular-nums; }
+#stop { font: 600 16px var(--font); padding: 10px 22px; border-radius: 8px; border: 2px solid var(--bad);
+        background: var(--bad); color: #fff; cursor: pointer; min-height: 44px; width: 13em; }
+#stop.armed { background: #7a0f0a; }
+#stop:focus-visible { outline: 3px solid var(--info); outline-offset: 2px; }
+#stop[disabled] { opacity: .6; cursor: default; }
+.banner { padding: 10px 14px; border-radius: 8px; font-weight: 600; }
+.banner.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad); }
+.banner.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); }
+.bar { height: 14px; background: var(--line); border-radius: 7px; overflow: hidden; margin: 8px 0 4px; }
+.bar > div { height: 100%; background: var(--bar); width: 100%; transform: scaleX(0); transform-origin: left; transition: transform .3s; }
+.counters { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
+.counter { display: flex; justify-content: space-between; gap: 10px; padding: 6px 10px; border-radius: 6px;
+           border: 1px solid var(--line); }
+.scroll { overflow-x: auto; max-height: 60vh; }
+table { width: 100%; border-collapse: collapse; }
+thead th { position: sticky; top: 0; background: var(--panel); }
+th, td { text-align: start; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+.st { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 13px; font-weight: 600; }
+.st-sent { background: var(--ok-bg); color: var(--ok); }
+.st-sent_unconfirmed, .st-pending { background: var(--warn-bg); color: var(--warn); }
+.st-no_form, .st-captcha, .st-login_required, .st-robots_blocked, .st-no_solicitation, .st-unclear_fields,
+.st-opted_out, .st-invalid_url { background: var(--line); color: var(--text); }
+tr.lvl-error td { background: var(--bad-bg); }
+tr.lvl-error .lvl, tr.lvl-warning .lvl { font-weight: 700; }
+tr.lvl-error .lvl { color: var(--bad); }
+tr.lvl-warning td { background: var(--warn-bg); }
+tr.lvl-warning .lvl { color: var(--warn); }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Posiblo outreach <span class="muted">· dashboard (read-only)</span></h1>
+  <div>
+    <span id="updated" class="muted mono" aria-live="polite">connecting…</span>
+    <button id="stop" type="button" aria-describedby="stop-help">STOP</button>
+  </div>
+</header>
+<p id="stop-help" class="muted" style="margin:6px 20px 0">STOP creates the STOP file: any running dry-run or send halts before its next site. Clear it only from the command line: <span class="mono">python -m outreach clear-stop</span>.</p>
+<div id="banners" style="padding: 8px 20px 0; display: grid; gap: 8px"></div>
+<main>
+  <section>
+    <h2>Current batch</h2>
+    <dl>
+      <dt>Batch</dt><dd id="batch-id" class="mono">–</dd>
+      <dt>State</dt><dd id="batch-state">–</dd>
+      <dt>Run</dt><dd id="run-mode">–</dd>
+      <dt>Processing</dt><dd id="run-site" dir="auto" class="mono">–</dd>
+    </dl>
+    <div class="bar" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="0" id="bar"><div id="bar-fill"></div></div>
+    <div id="progress-label" class="muted">–</div>
+  </section>
+  <section>
+    <h2>Circuit breaker</h2>
+    <dl>
+      <dt>State</dt><dd id="breaker-state">–</dd>
+      <dt>Consecutive failures</dt><dd id="breaker-count" class="mono">–</dd>
+    </dl>
+  </section>
+  <section class="wide">
+    <h2>Sites by status</h2>
+    <div class="counters" id="counters"></div>
+  </section>
+  <section class="wide">
+    <h2>Pending rows (need manual review)</h2>
+    <p class="muted" style="margin-top:0">A pending row was claimed but has no final result: a POST may or may not have happened. It is never retried automatically.</p>
+    <div class="scroll"><table><thead><tr><th>Site</th><th>Batch</th><th>Claimed at</th><th>Form</th></tr></thead>
+      <tbody id="pending"></tbody></table></div>
+  </section>
+  <section class="wide">
+    <h2>Latest events</h2>
+    <div class="scroll"><table><thead><tr><th>Time (UTC)</th><th>Level</th><th>Site</th><th>Status</th><th>Message / reason</th></tr></thead>
+      <tbody id="events"></tbody></table></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function cell(text, opts = {}) {
+  const td = document.createElement("td");
+  td.textContent = text == null || text === "" ? "–" : String(text);
+  if (opts.auto !== false) td.dir = "auto";
+  if (opts.cls) td.className = opts.cls;
+  return td;
+}
+function statusBadge(status) {
+  const td = document.createElement("td");
+  if (status) {
+    const s = document.createElement("span");
+    s.className = "st st-" + status;
+    s.textContent = status;
+    td.appendChild(s);
+  } else { td.textContent = "–"; }
+  return td;
+}
+function banner(text, kind) {
+  const d = document.createElement("div");
+  d.className = "banner " + kind;
+  d.textContent = text;
+  d.dir = "auto";
+  return d;
+}
+function render(d) {
+  $("updated").textContent = "updated " + d.now.replace("T", " ").replace("+00:00", " UTC");
+  const banners = $("banners");
+  banners.replaceChildren();
+  if (d.stop_file) banners.appendChild(banner("STOP file is present: runs are halted. Clear it with: python -m outreach clear-stop", "bad"));
+  if (!d.ledger_exists) banners.appendChild(banner("No ledger yet.", "warn"));
+  if (d.pending.length) banners.appendChild(banner(d.pending.length + " pending row(s) need manual review.", "warn"));
+  const run = d.run;
+  if (run && run.state === "halted") banners.appendChild(banner("Last " + run.mode + " of " + run.batch_id + " halted: " + (run.halted_reason || "?"), "bad"));
+  if (run && run.stale) banners.appendChild(banner("The running " + run.mode + " has not reported for more than 2 minutes.", "warn"));
+  $("stop").disabled = d.stop_file;
+
+  const b = d.batch;
+  $("batch-id").textContent = b ? b.batch_id : "–";
+  $("batch-state").textContent = b ? b.state : "–";
+  $("run-mode").textContent = run ? run.mode + " · " + run.state + " · " + (run.index || 0) + "/" + (run.total || 0) : "no run recorded";
+  $("run-site").textContent = run && run.state === "running" && run.site_key ? run.site_key : "–";
+  const pct = b ? b.percent : 0;
+  $("bar-fill").style.transform = "scaleX(" + (pct / 100) + ")";
+  $("bar").setAttribute("aria-valuenow", String(pct));
+  $("progress-label").textContent = b ? b.done + " / " + b.total + " " + b.progress_kind + " (" + pct + "%)" : "–";
+
+  const br = run && run.breaker;
+  $("breaker-state").textContent = br ? (br.tripped ? "TRIPPED" : "closed") : "–";
+  $("breaker-state").style.color = br && br.tripped ? "var(--bad)" : "";
+  $("breaker-count").textContent = br ? br.consecutive_failures + " / " + br.threshold : "–";
+
+  const counters = $("counters");
+  counters.replaceChildren();
+  for (const [status, n] of Object.entries(d.counters)) {
+    const c = document.createElement("div");
+    c.className = "counter";
+    const label = document.createElement("span");
+    label.className = "st st-" + status;
+    label.textContent = status;
+    const num = document.createElement("span");
+    num.className = "mono";
+    num.textContent = n;
+    c.append(label, num);
+    counters.appendChild(c);
+  }
+
+  const pending = $("pending");
+  pending.replaceChildren();
+  if (!d.pending.length) {
+    const tr = document.createElement("tr");
+    const td = cell("none", { cls: "muted" }); td.colSpan = 4; tr.appendChild(td); pending.appendChild(tr);
+  }
+  for (const p of d.pending) {
+    const tr = document.createElement("tr");
+    tr.append(cell(p.site_key, { cls: "mono" }), cell(p.batch_id), cell(p.claimed_at, { cls: "mono" }), cell(p.form_url, { cls: "mono" }));
+    pending.appendChild(tr);
+  }
+
+  const events = $("events");
+  events.replaceChildren();
+  if (!d.events.length) {
+    const tr = document.createElement("tr");
+    const td = cell("no events yet", { cls: "muted" }); td.colSpan = 5; tr.appendChild(td); events.appendChild(tr);
+  }
+  for (const e of d.events) {
+    const tr = document.createElement("tr");
+    tr.className = "lvl-" + e.level;
+    tr.append(cell(e.ts.replace("T", " ").replace("+00:00", ""), { cls: "mono", auto: false }),
+              cell(e.level, { cls: "lvl", auto: false }), cell(e.site_key, { cls: "mono" }),
+              statusBadge(e.site_status), cell(e.message));
+    events.appendChild(tr);
+  }
+}
+async function poll() {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (err) {
+    $("updated").textContent = "dashboard cannot read status: " + err.message;
+  }
+}
+let armed = null;
+$("stop").addEventListener("click", async () => {
+  const btn = $("stop");
+  if (!armed) {
+    btn.classList.add("armed");
+    btn.textContent = "Click again to STOP";
+    armed = setTimeout(() => { armed = null; btn.classList.remove("armed"); btn.textContent = "STOP"; }, 5000);
+    return;
+  }
+  clearTimeout(armed); armed = null;
+  btn.classList.remove("armed");
+  btn.textContent = "STOP";
+  try {
+    const r = await fetch("/stop", { method: "POST" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  } catch (err) {
+    $("updated").textContent = "STOP failed: " + err.message;
+  }
+  poll();
+});
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

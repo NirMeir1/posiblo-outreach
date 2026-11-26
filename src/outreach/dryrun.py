@@ -23,6 +23,7 @@ from .fetch import Fetcher
 from .finder import FetcherLike, FindResult, find_contact_form
 from .ledger import Ledger
 from .message import message_version, render_message
+from .runstatus import write_status
 
 READY = "ready"
 FETCH_ERROR = "fetch_error"
@@ -117,6 +118,8 @@ def run_dry_run(config: Config, ledger: Ledger, batch_id: str, *, fetcher: Fetch
             if config.stop_file.exists():
                 report.halted_reason = f"STOP file found ({config.stop_file})"
                 break
+            write_status(config.log_dir, mode="dry-run", batch_id=batch_id, state="running", index=i,
+                         total=len(sites), site_key=site["site_key"], breaker=breaker.state(), halted_reason=None)
             so = _evaluate(site, ledger, fetcher)
             report.outcomes.append(so)
             ledger.add_dry_run_result(batch_id, so.site_key, so.outcome, so.form_url,
@@ -139,6 +142,9 @@ def run_dry_run(config: Config, ledger: Ledger, batch_id: str, *, fetcher: Fetch
         ledger.add_event("info", f"dry-run {batch_id} done")
     else:
         ledger.add_event("warning", f"dry-run {batch_id} halted: {report.halted_reason}")
+    write_status(config.log_dir, mode="dry-run", batch_id=batch_id,
+                 state="finished" if report.completed else "halted", index=len(report.outcomes),
+                 total=len(sites), site_key=None, breaker=breaker.state(), halted_reason=report.halted_reason)
 
     counts: dict[str, int] = {}
     for so in report.outcomes:

@@ -16,6 +16,8 @@ Run every command from the project folder (the folder that contains `pyproject.t
 | `python -m outreach approve <batch_id>` | Only after a complete dry-run. Shows ready/skipped counts and asks you to type the batch id. Freezes the list of `ready` sites. |
 | `python -m outreach export <batch_id>` | Writes `reports/<batch_id>-<timestamp>.csv` as a new file (never overwrites, never touches the input CSV). |
 | `python -m outreach send <batch_id>` | **Live sending, disabled by default.** Refuses unless `ALLOW_LIVE=1` is set in the real environment, the batch is approved, live preflight passes (no `TODO` in sender details), there is no `STOP` file and a fresh backup was just written. Sends at most one message per approved site, never retries. Do not enable until the lawyer has answered. |
+| `python -m outreach dashboard [--port 8765]` | Read-only monitoring page on `http://127.0.0.1:8765/` (refreshes every 2 s): current batch and progress, counters per status, the site being processed, circuit breaker, pending rows, latest events. Has a STOP button. Runs as its own process; `send` never loads it. |
+| `python -m outreach clear-stop` | Removes the `STOP` file (type `CLEAR` to confirm). The dashboard cannot clear STOP. |
 | `python -m outreach reopen <site_key>` | Lets a site be planned again after `no_form`, `captcha`, `login_required`, `robots_blocked` or `unclear_fields` (no message was ever sent for those). Refused for every other status. Asks you to type the site key. |
 
 ## Settings

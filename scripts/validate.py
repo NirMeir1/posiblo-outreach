@@ -39,7 +39,7 @@ TESTS = ROOT / "tests"
 LOG = ROOT / "docs" / "validation-log.md"
 BUILD_PROMPTS = ROOT / "docs" / "build-prompts.md"
 
-LATEST_IMPLEMENTED_STEP = 5
+LATEST_IMPLEMENTED_STEP = 6
 
 # CLI commands that must exist (and no others) after each step (A8).
 EXPECTED_COMMANDS: dict[int, list[str]] = {
@@ -47,6 +47,8 @@ EXPECTED_COMMANDS: dict[int, list[str]] = {
     3: ["ingest", "status", "backup", "suppress"],
     4: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export"],
     5: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen"],
+    6: ["ingest", "status", "backup", "suppress", "dry-run", "approve", "export", "send", "reopen", "dashboard",
+        "clear-stop"],
 }
 
 # --- reference data -------------------------------------------------------
@@ -1216,14 +1218,22 @@ def _calls_with_func(path: Path) -> list[tuple[int, str, str, list[str]]]:
     return out
 
 
+_SERVER_ROUTE = re.compile(r"^\s*@\w+\.(route\(.*methods\s*=\s*\[[^\]]*[\"']POST[\"']|post\()")
+
+
 def p5_single_post(step: int, state: dict) -> Result:
-    sends = []
+    sends, routes = [], []
     for p in _py_files(SRC):
         for i, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
-            if _POST_SEND.search(line):
+            if _SERVER_ROUTE.search(line):
+                routes.append(f"{_rel(p)}:{i}: {line.strip()}")
+            elif _POST_SEND.search(line):
                 sends.append((p, i, line.strip()))
     ev = [f"request-sending lines in src/ (pattern of P3.1): {len(sends)}"]
     ev += [f"  {_rel(p)}:{i}: {l}" for p, i, l in sends]
+    ev += [f"server route that RECEIVES a POST (not a request the tool makes): {r}" for r in routes]
+    if any("dashboard.py" not in r for r in routes):
+        return Result("P5.1", "FAIL", ev + ["a POST route outside dashboard.py"])
     send_py = SRC / "outreach" / "send.py"
     fn = _function_source(send_py, "_post_once")
     post_ok = (len(sends) == 1 and sends[0][0] == send_py and fn is not None and fn[1] <= sends[0][1] <= fn[2])
@@ -1448,6 +1458,187 @@ def p5_allow_live_and_no_real_send(step: int, state: dict) -> Result:
     return Result("P5.8", "PASS" if ok else "FAIL", ev)
 
 
+# --- After Prompt 6 -------------------------------------------------------
+
+DASH = SRC / "outreach" / "dashboard.py"
+DASH_HTML = SRC / "outreach" / "dashboard.html"
+
+
+def p6_bind(step: int, state: dict) -> Result:
+    binds = _lines_matching(DASH, r"BIND_HOST\s*=|host\s*=")
+    any_all = []
+    for p in _py_files(SRC):
+        any_all += _lines_matching(p, r"[\"']0\.0\.0\.0[\"']|host\s*=\s*[\"']\s*[\"']|[\"']::[\"']")
+    cli_host = _lines_matching(SRC / "outreach" / "cli.py", r"--host")
+    ok, ev = _required(state, {"serve() binds 127.0.0.1": "tests/test_dashboard.py::test_serve_binds_to_loopback_only",
+                               "foreign Host header refused":
+                                   "tests/test_dashboard.py::test_status_and_page_reject_foreign_host"})
+    good = any('BIND_HOST = "127.0.0.1"' in b for b in binds) and any("host=BIND_HOST" in b for b in binds)
+    ev = binds + [f"0.0.0.0 / wildcard binds in src/: {any_all or 'none'}", f"--host option in CLI: {cli_host or 'none'}"] + ev
+    return Result("P6.1", "PASS" if ok and good and not any_all and not cli_host else "FAIL", ev)
+
+
+def p6_read_only(step: int, state: dict) -> Result:
+    opens = _lines_matching(DASH, r"open_readonly\(|sqlite3\.connect\(|Ledger\(")
+    ro = _lines_matching(SRC / "outreach" / "ledger.py", r"\?mode=ro")
+    writes = _lines_matching(DASH, r"\b(INSERT|UPDATE|DELETE|REPLACE)\b")
+    ok, ev = _required(state, {
+        "write attempts fail on the dashboard connection": "tests/test_dashboard.py::test_dashboard_connection_is_read_only",
+        "every connection URI ends with ?mode=ro": "tests/test_dashboard.py::test_dashboard_uses_mode_ro",
+        "ledger bytes unchanged by dashboard requests":
+            "tests/test_dashboard.py::test_dashboard_requests_do_not_change_the_ledger",
+    })
+    only_ro = bool(opens) and all("open_readonly(" in o for o in opens)
+    ev = [f"ledger access in dashboard.py: {opens}", f"open_readonly(): {ro}",
+          f"SQL writes in dashboard.py: {writes or 'none'}"] + ev
+    return Result("P6.2", "PASS" if ok and only_ro and ro and not writes else "FAIL", ev)
+
+
+def p6_stop(step: int, state: dict) -> Result:
+    clears = []
+    for p in _py_files(SRC):
+        for ln, name, func, _ in _calls_with_func(p):
+            if name in ("unlink", "remove") and "stop" in (p.read_text(encoding="utf-8-sig").splitlines()[ln - 1]).lower():
+                clears.append(f"{_rel(p)}:{ln} in {func}()")
+    ok, ev = _required(state, {
+        "STOP endpoint creates the file": "tests/test_dashboard.py::test_stop_creates_file",
+        "bad Origin / Host rejected (6 cases)": "tests/test_dashboard.py::test_stop_rejects_bad_origin_or_host[",
+        "no route clears STOP; routes are exactly GET /, GET /api/status, POST /stop":
+            "tests/test_dashboard.py::test_stop_only_via_post_and_nothing_clears_it",
+        "clear-stop is a CLI command": "tests/test_dashboard.py::test_clear_stop_is_a_cli_command",
+    })
+    origin = _lines_matching(DASH, r"_origin_ok\(request")
+    ev = origin + [f"code that removes the STOP file: {clears}"] + ev
+    only_cli = clears == ["src/outreach/cli.py:" + clears[0].split(":")[1].split(" ")[0] + " in cmd_clear_stop()"] \
+        if len(clears) == 1 else False
+    return Result("P6.3", "PASS" if ok and origin and only_cli else "FAIL", ev)
+
+
+def p6_assets(step: int, state: dict) -> Result:
+    html = DASH_HTML.read_text(encoding="utf-8-sig")
+    urls = re.findall(r"https?://[^\s\"'<>)]+|//cdn[^\s\"']*", html)
+    ext = re.findall(r"<(?:script|link|img)[^>]+(?:src|href)\s*=\s*[\"'](?!/|#)[^\"']+", html, re.I)
+    dir_auto = len(re.findall(r'dir="auto"|\.dir = "auto"', html))
+    font = re.search(r"--font:\s*([^;]+);", html)
+    ok, ev = _required(state, {"page offline + Hebrew-ready": "tests/test_dashboard.py::test_page_is_offline_and_hebrew_ready"})
+    ev = [f"http(s) URLs in dashboard.html: {urls or 'none'}", f"external script/link/img: {ext or 'none'}",
+          f"dir=\"auto\" uses (markup + text cells built in JS): {dir_auto}",
+          f"font stack: {font.group(1).strip() if font else 'missing'}"] + ev
+    return Result("P6.4", "PASS" if ok and not urls and not ext and dir_auto >= 2 and font else "FAIL", ev)
+
+
+def p6_own_process(step: int, state: dict) -> Result:
+    importers = []
+    for p in _py_files(SRC):
+        tree = ast.parse(p.read_text(encoding="utf-8-sig"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and ("dashboard" in node.module or node.module == "flask"):
+                importers.append(f"{_rel(p)}:{node.lineno}: from {node.module}")
+            elif isinstance(node, ast.Import) and any("dashboard" in a.name or a.name == "flask" for a in node.names):
+                importers.append(f"{_rel(p)}:{node.lineno}: import")
+    lazy = _function_source(SRC / "outreach" / "cli.py", "cmd_dashboard")
+    lazy_ok = bool(lazy) and "from .dashboard import serve" in lazy[0]
+    proc = _run_project_code("""
+        import sys, outreach.cli, outreach.send, outreach.dryrun
+        print('flask' in sys.modules, 'outreach.dashboard' in sys.modules)
+        """)
+    loaded = proc.stdout.split()
+    ok, ev = _required(state, {"send/dry-run never import the dashboard":
+                               "tests/test_dashboard.py::test_send_and_dry_run_never_import_the_dashboard"})
+    allowed = all(i.startswith(("src/outreach/dashboard.py", "src/outreach/cli.py")) for i in importers)
+    ev = [f"imports of flask / dashboard in src/: {importers}",
+          f"cli imports the dashboard only inside cmd_dashboard(): {lazy_ok}",
+          f"after importing cli+send+dryrun: flask loaded={loaded[0] if loaded else '?'}, "
+          f"dashboard loaded={loaded[1] if len(loaded) > 1 else '?'}"] + ev
+    return Result("P6.5", "PASS" if ok and allowed and lazy_ok and loaded == ["False", "False"] else "FAIL", ev)
+
+
+_SEED = """
+from outreach.config import load_config
+from outreach.ledger import Ledger
+from outreach.runstatus import write_status
+cfg = load_config(environ={})
+with Ledger(cfg.ledger_path) as led:
+    keys = ["mispara-example.co.il", "xn--6dbbec0c.co.il", "garage-example.co.il", "yoga-example.co.il"]
+    led.create_batches([[{"site_key": k, "domain": k, "input_url": "https://" + k + "/"} for k in keys]])
+    for k in keys:
+        led.add_dry_run_result("B0001", k, "ready" if k != "yoga-example.co.il" else "captcha",
+                               "https://" + k + "/contact", "{}", None)
+    led.finish_dry_run("B0001"); led.approve("B0001"); led.begin_send("B0001")
+    led.claim(keys[0], domain=keys[0], input_url="x", batch_id="B0001", form_url="https://" + keys[0] + "/contact")
+    led.finish(keys[0], "sent", "HTTP 200, success text 'תודה'")
+    led.claim(keys[1], domain=keys[1], input_url="x", batch_id="B0001", form_url="https://" + keys[1] + "/contact")
+    led.finish(keys[1], "sent_unconfirmed", "HTTP 500 after POST")
+    led.claim(keys[2], domain=keys[2], input_url="x", batch_id="B0001", form_url="https://" + keys[2] + "/contact")
+    led.add_event("info", "send B0001: sent: HTTP 200, success text 'תודה'", site_key=keys[0])
+    led.add_event("warning", "send B0001: sent_unconfirmed: HTTP 500 after POST", site_key=keys[1])
+write_status(cfg.log_dir, mode="send", batch_id="B0001", state="running", index=3, total=3, site_key=keys[2],
+             breaker={"threshold": 5, "consecutive_failures": 1, "tripped": False}, halted_reason=None)
+print("seeded")
+"""
+
+
+def _free_port() -> int:
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def p6_live_dashboard(step: int, state: dict) -> Result:
+    import json as _json
+    import time as _time
+    import urllib.request
+    ev: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "templates").mkdir()
+        shutil.copyfile(ROOT / "templates" / "consent_request_v1.txt", root / "templates" / "consent_request_v1.txt")
+        seed = _run_project_code(_SEED, cwd=root)
+        if "seeded" not in seed.stdout:
+            return Result("P6.6", "FAIL", [f"seeding failed: {seed.stderr[-300:]}"])
+        port = _free_port()
+        env = {k: v for k, v in os.environ.items() if k != "ALLOW_LIVE"}
+        env.update(PYTHONPATH=str(SRC), PYTHONIOENCODING="utf-8")
+        server = subprocess.Popen([sys.executable, "-m", "outreach", "dashboard", "--port", str(port)], cwd=root,
+                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            data, page = None, ""
+            for _ in range(50):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as r:
+                        data = _json.loads(r.read().decode("utf-8"))
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+                        page = r.read().decode("utf-8")
+                    break
+                except OSError:
+                    _time.sleep(0.2)
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+    if data is None:
+        return Result("P6.6", "FAIL", ["dashboard did not answer on 127.0.0.1"])
+    b = data["batch"] or {}
+    ev = [f"started `python -m outreach dashboard --port {port}` as its own process against a seeded temp ledger",
+          f"counters: { {k: v for k, v in data['counters'].items() if v} }",
+          f"progress: batch {b.get('batch_id')} {b.get('state')}: {b.get('done')}/{b.get('total')} ({b.get('percent')}%)",
+          f"processing now: {(data['run'] or {}).get('site_key')}; breaker: {(data['run'] or {}).get('breaker')}",
+          f"pending rows: {[p['site_key'] for p in data['pending']]}",
+          f"events shown: {len(data['events'])} (levels {[e['level'] for e in data['events']]})",
+          f"page served: {len(page)} bytes, has STOP button: {'id=\"stop\"' in page}, polls every 2 s: "
+          f"{'setInterval(poll, 2000)' in page}",
+          "server process terminated; temp project deleted"]
+    ok = (data["counters"].get("sent") == 1 and data["counters"].get("sent_unconfirmed") == 1
+          and data["counters"].get("pending") == 1 and b.get("done") == 2 and b.get("total") == 3
+          and len(data["pending"]) == 1 and len(data["events"]) >= 2 and 'id="stop"' in page)
+    return Result("P6.6", "PASS" if ok else "FAIL", ev)
+
+
 STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     0: [p0_dirs, p0_gitignore, p0_pyproject, p0_claude_md, p0_scaffold_only, p0_script],
     1: [p1_normalizer, p1_tldextract_offline, p1_pragmas, p1_claim_code, p1_update_delete_scan,
@@ -1458,6 +1649,7 @@ STEPS: dict[int, list[Callable[[int, dict], Result]]] = {
     4: [p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export, p3_no_post],
     5: [p5_single_post, p5_gates, p5_order, p5_no_retry, p5_required_tests, p5_reopen, p5_mutations,
         p5_allow_live_and_no_real_send],
+    6: [p6_bind, p6_read_only, p6_stop, p6_assets, p6_own_process, p6_live_dashboard],
 }
 # Checks from earlier steps that must stay true at every later step (used by --all).
 PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_offline, p1_pragmas,
@@ -1466,7 +1658,8 @@ PERSISTENT = {p0_dirs, p0_gitignore, p0_claude_md, p1_normalizer, p1_tldextract_
               p3_no_browser, p3_fetcher, p3_fixtures, p3_finder_classifier, p3_extra_fetches,
               p4_dry_run_no_claim, p4_dry_run_results, p4_report_message, p4_approve, p4_export,
               p5_single_post, p5_gates, p5_order, p5_no_retry, p5_required_tests, p5_reopen, p5_mutations,
-              p5_allow_live_and_no_real_send}
+              p5_allow_live_and_no_real_send,
+              p6_bind, p6_read_only, p6_stop, p6_assets, p6_own_process, p6_live_dashboard}
 
 
 # --- driver ---------------------------------------------------------------

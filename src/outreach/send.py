@@ -42,6 +42,7 @@ from .finder import captcha_marker, choose_form, visible_text
 from .ledger import SENDABLE_BATCH_STATES, Ledger
 from .message import MessageError, message_version, render_message
 from .preflight import run_preflight
+from .runstatus import write_status
 from .sendlog import EVENT_CLAIMED, EVENT_RESULT, SendLog
 
 SUBJECT = "פרסומת - בקשת הסכמה"
@@ -256,12 +257,18 @@ class _Run:
                               site_key=key)
         return SiteSend(key, status, detail, posted=True)
 
+    def _status(self, state: str, index: int, total: int, site_key: str | None, breaker: CircuitBreaker,
+                halted_reason: str | None = None) -> None:
+        write_status(self.config.log_dir, mode="send", batch_id=self.batch_id, state=state, index=index,
+                     total=total, site_key=site_key, breaker=breaker.state(), halted_reason=halted_reason)
+
     def run(self, sites: list[dict], report: SendReport) -> None:
         breaker = CircuitBreaker(self.config.breaker_threshold)
         for i, site in enumerate(sites, 1):
             if self.config.stop_file.exists():
                 report.halted_reason = f"STOP file found ({self.config.stop_file})"
                 break
+            self._status("running", i, len(sites), site["site_key"], breaker)
             r = self._send_one(site)
             report.sites.append(r)
             self.out(f"[{i}/{len(sites)}] {r.site_key}  {r.result.upper()}  {r.detail}")
@@ -272,6 +279,8 @@ class _Run:
                     break
             elif r.result == SENT:
                 breaker.record_success()
+        self._status("halted" if report.halted_reason else "finished", len(report.sites), len(sites), None,
+                     breaker, report.halted_reason)
 
 
 def run_send(config: Config, ledger: Ledger, batch_id: str, *, environ: Mapping[str, str] | None = None,
@@ -326,6 +335,10 @@ def run_send(config: Config, ledger: Ledger, batch_id: str, *, environ: Mapping[
             ledger.add_event("info", f"send {batch_id} finished")
         else:
             ledger.add_event("error", f"send {batch_id} halted: {report.halted_reason or 'unexpected error'}")
+            if not completed:
+                write_status(config.log_dir, mode="send", batch_id=batch_id, state="halted",
+                             index=len(report.sites), total=len(sites), site_key=None, breaker=None,
+                             halted_reason="unexpected error (see events)")
         try:
             after = create_backup(config)
             report.backup = str(after.local)

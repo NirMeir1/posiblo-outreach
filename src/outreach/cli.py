@@ -189,6 +189,31 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    # Imported here, not at module top: send/dry-run never load Flask or the dashboard.
+    from .dashboard import serve
+    serve(load_config(), port=args.port)
+    return 0
+
+
+def cmd_clear_stop(args: argparse.Namespace) -> int:
+    config = load_config()
+    stop = config.stop_file
+    if not stop.exists():
+        print(f"no STOP file at {stop}")
+        return 0
+    typed = input(f"Remove {stop} and allow runs again? Type CLEAR to confirm: ").strip()
+    if typed != "CLEAR":
+        print("not cleared", file=sys.stderr)
+        return 1
+    stop.unlink()
+    if config.ledger_path.is_file():
+        with Ledger(config.ledger_path) as led:
+            led.add_event("warning", "STOP file cleared from the command line")
+    print(f"STOP file removed: {stop}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m outreach",
                                 description="Posiblo outreach: one consent-request message per site, sent once.")
@@ -232,6 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("reopen", help="make a site plannable again after no_form/captcha/login/robots/unclear")
     sp.add_argument("site_key")
     sp.set_defaults(func=cmd_reopen)
+
+    sp = sub.add_parser("dashboard", help="read-only monitoring page on http://127.0.0.1 (with a STOP button)")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.set_defaults(func=cmd_dashboard)
+
+    sp = sub.add_parser("clear-stop", help="remove the STOP file (type CLEAR to confirm); only possible here")
+    sp.set_defaults(func=cmd_clear_stop)
     return p
 
 
