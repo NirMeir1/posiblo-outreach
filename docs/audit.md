@@ -2,25 +2,24 @@
 
 Goal: try to break the send-once guarantee and the safety rules in CLAUDE.md.
 
-- **Behavior:** this audit changed no behavior in `src/`. Every behavior fix is a proposal (A, B, C below) waiting for the owner's approval.
-- **What was committed:** new tests for gaps, the README, this report and the validation script.
-- **Line numbers** refer to commit `5c5843e` plus this audit's commit.
+- **Behavior:** the audit itself (commit `2154461`) changed no behavior. Its three proposals (A, B, C) were shown as diffs and approved by the owner afterwards, with one change to B. The owner also requested four more changes. All seven are listed in `docs/proposals/APPROVED.md` and in section 13. Sections 1–12 have been updated to the current code.
+- **Line numbers** refer to the current code.
 
 ## 1. Every code path that performs an HTTP POST
 
 | Where | What | Verdict |
 |---|---|---|
-| `src/outreach/send.py:158` in `_post_once()` | `client.stream("POST", plan.action_url, ...)` | **The only POST the tool makes.** |
+| `src/outreach/send.py:173` in `_post_once()` | `client.stream("POST", plan.action_url, ...)` | **The only POST the tool makes.** |
 | `src/outreach/dashboard.py`, route `/stop` | Flask route that *receives* a POST from the local dashboard page | Not a request the tool makes. Loopback only; Host and Origin are checked. |
 | `src/outreach/dashboard.html` | Browser `fetch("/stop", {method: "POST"})` to the local dashboard | Browser to 127.0.0.1 only; creates the STOP file. |
 
-- **One caller:** `_post_once()` is called once, at `send.py:248` in `_Run._send_one()`, and not inside any loop in that function.
+- **One caller:** `_post_once()` is called once, at `send.py:270` in `_Run._send_one()`, and not inside any loop in that function. The per-site `try/except Exception` around it is not a loop and never calls it again.
 - **One entry point:** `_send_one` ← `_Run.run` ← `run_send` ← `cli.cmd_send` ← `python -m outreach send`. Only `cli.py` imports `send.py`.
 - **No other way out:**
   - `fetch.Fetcher` only calls `stream("GET", ...)`.
-  - Both HTTP clients use `follow_redirects=False` (`fetch.py:141`, `send.py:324`), so a redirect can never be replayed as a second POST.
+  - Both HTTP clients use `follow_redirects=False` (`fetch.py:164`, `send.py:359`), so a redirect can never be replayed as a second POST.
   - httpx is used without retries (its default), and no retry library is installed.
-- **Claim first.** Before line 248 come the claim at `send.py:237` (`Ledger.claim()`, which runs `BEGIN IMMEDIATE`, `INSERT ... ON CONFLICT DO NOTHING`, then `COMMIT` before returning) and the send-log "claimed" line at `send.py:243`, which is fsynced. If `claim()` returns False, the function returns before the POST.
+- **Claim first.** Before line 270 come the claim at `send.py:252` (`Ledger.claim()`, which runs `BEGIN IMMEDIATE`, `INSERT ... ON CONFLICT DO NOTHING`, then `COMMIT` before returning) and the send-log "claimed" line at `send.py:264`, which is fsynced. If `claim()` returns False, the function returns before the POST.
 - **Proven by mutation:** in temporary copies, moving the POST before the claim, removing the ALLOW_LIVE check, or making `claim()` always return True each makes a test fail (validation P5.7).
 
 ## 2. LLM / AI SDK scan
@@ -46,7 +45,7 @@ Goal: try to break the send-once guarantee and the safety rules in CLAUDE.md.
 | `example.co.il` and `example.com` (two domains) | Two sites, so two messages are possible | None. Inherent to "one message per site". |
 | `user.wixsite.com` (no path) and `user.wixsite.com/site` | Two keys | `sites.form_url` is UNIQUE: if both resolve to the same form URL, the second claim returns False. |
 | Facebook vanity URL and `profile.php?id=` of the same page | Two keys | robots.txt blocks facebook and these pages have no usable form, so in practice nothing is sent. |
-| A tldextract upgrade that changes the bundled public-suffix list | A previously sent site could get a new key | `form_url` UNIQUE catches the common case. Residual risk 6: pin the dependency versions. |
+| A tldextract upgrade that changes the bundled public-suffix list | A previously sent site could get a new key | Fixed: all versions are pinned (`pyproject.toml`, `requirements.lock`), and `tests/test_dependencies.py` fails if the installed tldextract differs. `form_url` UNIQUE remains a second backstop. |
 
 **The other direction (one key for two businesses):** shared hosts that are not in `PLATFORMS`, such as `x.myshopify.com` or `x.web.app`, get the host's registrable domain as their key. Different businesses then collide, and only the first is ever contacted. That is the safe direction: fewer messages, never more.
 
@@ -61,6 +60,7 @@ Goal: try to break the send-once guarantee and the safety rules in CLAUDE.md.
 | During the POST | `pending`; the message may have arrived | No. |
 | After the POST, before `finish()` | `pending` | No. |
 | After `finish()`, before the send-log "result" line | Ledger final; the send log has a claim with no result | No. |
+| Unexpected exception (not a crash) anywhere after the claim, also inside verify or finish | Caught per site: event logged, row left `pending` (unless finish already ran), breaker failure, run continues | No. Tested after the POST, inside verify, and before the POST. |
 | After the run, closing backup fails | Printed loudly | No. |
 
 No window exists in which a POST can happen without a committed claim.
@@ -82,7 +82,7 @@ No window exists in which a POST can happen without a committed claim.
 
 - **History exists:** if backups (local or offsite) or the send log exist, `ingest`, `dry-run`, `approve`, `suppress add`, `reopen` and `send` refuse to run and print the newest backup. Tested: `test_refuses_when_ledger_missing_but_backup_exists`, `..._offsite_backup_exists`, `..._send_log_exists`, and `test_send_refused_when_ledger_missing_but_send_log_exists`.
 - **Read-only commands:** `status`, `export` and `dashboard` never create the ledger.
-- **Gap: restoring an old backup.** If the ledger is restored from a backup older than the last send, nothing notices that the send log has claims the ledger lacks. Sites sent after that backup could be contacted again. → **Proposal C.**
+- **Restoring an old backup (fixed, proposal C).** Preflight now compares the send log with the ledger and refuses to run when claimed sites are missing (`test_refuses_when_send_log_claims_are_missing_from_a_restored_ledger`).
 - **Gap: copying `ledger.db` without its `-wal` file.** This loses committed claims, and even the table definitions; `test_raw_copy_of_ledger_file_can_lose_claims_but_backup_does_not` proves it. The README now warns against it. The `backup` command is safe.
 - **Everything lost:** if the ledger, every backup and the send log are all lost, the tool starts fresh and could contact everyone again. Offsite backups are the mitigation.
 
@@ -101,6 +101,7 @@ No.
 
 - **Updates:** the only UPDATE on `sites` is `finish()`: `WHERE site_key = ? AND status = 'pending'`, and it is only called right after this run's own successful claim. A `pending` row left over from a crash is never finished automatically.
 - **Deletes:** the only DELETE on `sites` is `reopen()`, restricted in code to the five no-POST statuses and refused for every other status (tested).
+- **Inserts:** besides `claim()`, the only INSERT into `sites` is `record_no_post_outcomes()`. It runs for a finished batch and only for those five no-POST statuses. It uses `ON CONFLICT DO NOTHING`, so an existing row (pending, sent, ...) is never touched (tested).
 - **Database triggers** independently refuse to:
   - delete `pending`, `sent`, `sent_unconfirmed` or `opted_out` rows;
   - move any row back to `pending`;
@@ -121,62 +122,75 @@ No.
 
 ### 10.1 robots.txt: "404 must mean allowed; only network errors and 5xx may mean disallow"
 
-Current code (`src/outreach/fetch.py`, `_fetch_robots`, lines 249–273):
+The current code is `src/outreach/fetch.py`, `_fetch_robots`, from line 278. It is proposal B with the owner's change: 429 means disallow.
 
-| robots.txt result | Today | Your rule | Test |
-|---|---|---|---|
-| 404 / 410 (missing) | **allowed** | allowed ✔ | `test_robots_404_means_allow_and_page_is_fetched`, `test_robots_status_handling[404-True]`, `[410-True]` |
-| 5xx | **disallow** | disallow ✔ | `test_robots_status_handling[500-False]`, `[503-False]` |
-| Network error (unreachable) | **disallow** | disallow ✔ | `test_robots_network_error_means_disallow` |
-| Timeout | **disallow** | disallow ✔ | `test_robots_timeout_means_disallow` |
-| 401 / 403 | disallow | allowed ✘ | `test_robots_status_handling[401-False]`, `[403-False]` |
-| 429 | allowed | allowed ✔ | `test_robots_429_is_currently_treated_as_allow` |
-| Redirect to another domain | disallow | allowed ✘ | none |
-| More than 3 redirects | disallow | allowed ✘ | none |
-| Body over 2 MB | disallow | allowed ✘ | none |
-
-So 404 already means "allowed", and network errors and 5xx already mean "disallow". The four ✘ rows violate "only network errors and 5xx". **Proposal B** fixes them: any 4xx is allowed; robots redirects are followed up to 3 hops, including to another host, where only robots.txt is read; more hops count as "no robots.txt"; an oversized file is parsed up to the cap.
-
-My recommendation, one exception to your rule: treat **429 Too Many Requests** like 5xx (disallow for this run). It means "slow down", not "no file". RFC 9309 groups it with other 4xx, but Google treats it as a server error. Proposal B follows your rule as written; tell me if you want the 429 exception.
+| robots.txt result | Behaviour | Test |
+|---|---|---|
+| 404 / 410 (missing) | allowed | `test_robots_404_means_allow_and_page_is_fetched`, `test_robots_status_handling[404-True]`, `[410-True]` |
+| 401 / 403 / other 4xx | allowed | `test_robots_401_403_mean_allow_and_page_is_fetched[401]`, `[403]`, `test_robots_status_handling[400-True]` |
+| 429 | **disallow** (owner's decision) | `test_robots_429_means_disallow_and_page_is_not_requested`, `test_robots_status_handling[429-False]` |
+| 5xx | disallow | `test_robots_status_handling[500-False]`, `[502-False]`, `[503-False]` |
+| Network error (unreachable) | disallow | `test_robots_network_error_means_disallow` |
+| Timeout | disallow | `test_robots_timeout_means_disallow` |
+| Redirect, also to another host | followed (up to 3 hops) | `test_robots_redirect_to_another_host_is_followed` |
+| More than 3 redirects | treated as missing: allowed | `test_robots_too_many_redirects_is_treated_as_missing` |
+| Body over 2 MB | parsed up to 2 MB | `test_oversized_robots_is_parsed_up_to_the_cap` |
 
 ### 10.2 POST encoding
 
-It does **not** follow the form's charset today: `_post_once()` always encodes in UTF-8 (`send.py`, `urlencode(pairs, encoding="utf-8")`). **Proposal A** fixes this:
-- The plan takes the charset from `accept-charset` (the first label Python knows), else the encoding the page was decoded with, else UTF-8.
-- The POST encodes with it. Characters the charset cannot represent become `&#NNNN;`, as browsers do.
-- The charset is part of the approved-plan comparison. Plans approved before the change compare as UTF-8.
+Fixed (proposal A). The plan takes the form's charset from `accept-charset` (the first label Python knows), else the encoding the page was decoded with, else UTF-8. `_post_once()` encodes with it, and characters the charset cannot represent become `&#NNNN;`. The charset is part of the approved-plan comparison; plans approved before the change compare as UTF-8.
+
+Tests: `tests/test_charset.py`. One of them runs a full dry-run → approve → send against a local Windows-1255 page and checks the exact bytes received, including `→` arriving as `&#8594;`.
 
 ### 10.3 reopen: remove or wire up?
 
-**Recommendation: wire it up.**
-- **The gap:** today no code ever writes `no_form`, `captcha`, `login_required`, `robots_blocked` or `unclear_fields` into `sites`. Dry-run must not write `sites`, and `send` only skips such sites (they stay unclaimed). So `reopen` works and is tested, but has nothing to act on.
-- **Why wire it up rather than remove:**
-  1. CLAUDE.md lists these as *site statuses*, so they are meant to be in the ledger.
-  2. Without them, sites that cannot be contacted are re-planned after every finished batch. Each one is then fetched again in every later dry-run: repeated visits to sites that showed a CAPTCHA or a login wall, which is not polite.
-  3. Once they are recorded, `reopen` becomes the deliberate, logged way to retry a site after it changes. It already refuses anything where a POST may have happened.
-- **Suggested wiring (not implemented):** when a `send` run finishes a batch, record each non-ready dry-run outcome of that batch as a final status without any POST. That means a `claim()` immediately followed by `finish(<status>)`, plus a send-log line marked `posted: false`, so proposal C's consistency check stays exact.
-- **Alternative:** if you'd rather keep the tool smaller, remove `reopen` and its tests. Nothing else depends on it.
+Wired up, per the owner's decision.
+- **What happens:** when a `send` run finishes a batch (not halted), `ledger.record_no_post_outcomes()` records that batch's dry-run outcomes `no_form`, `captcha`, `login_required`, `robots_blocked` and `unclear_fields` in `sites`.
+- **How:** one INSERT per site, with the final status, no `pending` state, no request and no send-log line. A ready site is never recorded, and existing rows are never touched.
+- **Effect:** later ingests skip these sites as already handled. `reopen` (still limited to these five statuses) releases one, and it can then be planned again.
+- **Tests:**
+  - `test_finished_batch_records_no_post_outcomes_without_any_request`;
+  - `test_recorded_outcome_can_be_reopened_and_planned_again`;
+  - `test_halted_by_breaker_records_nothing`;
+  - `test_ready_site_skipped_at_send_time_is_not_recorded`;
+  - `test_record_no_post_outcomes_only_records_the_five_statuses`.
 
-## 11. Proposals waiting for approval (not applied)
+## 11. Proposals: shown, then approved and applied
 
-Each one was made in a scratchpad copy of the repo and the full suite was run there. With A, B and C applied together, 435 tests pass. The patches are in `docs/proposals/` (`A-post-charset.patch`, `B-robots-status-rule.patch`, `C-sendlog-ledger-check.patch`). Each applies cleanly with `git apply docs/proposals/<file>`, on its own or after the others.
+The three diffs (in `docs/proposals/`) were shown to the owner before any change. The owner approved them on 2026-11-26, with 429 → disallow added to B. All three are now applied. `docs/proposals/APPROVED.md` records every decision. Validation P7.3 requires each decision to be listed there and proven by passing tests.
 
-| | Change | Files | Tests in the copy |
-|---|---|---|---|
-| A | POST uses the form's charset (accept-charset → page encoding → UTF-8) | `fetch.py`, `classify.py`, `finder.py`, `send.py` + `tests/test_charset.py` | 429 pass |
-| B | robots.txt: only network errors and 5xx disallow; follow redirects; parse oversized files up to the cap | `fetch.py` + `tests/test_fetch.py` | 421 pass |
-| C | Preflight refuses when send-log claims are missing from the ledger (restored from an old backup) | `preflight.py` + `tests/test_preflight.py`; validation P2.4's expected check order gains `sendlog_consistency` | 417 pass |
+| | Change | State |
+|---|---|---|
+| A | POST uses the form's charset | applied |
+| B | robots.txt: only network errors, 5xx and 429 disallow; follow redirects; parse oversized files up to the cap | applied, with the 429 change |
+| C | Preflight refuses when send-log claims are missing from the ledger | applied |
 
 ## 12. Residual risks, ranked
 
-1. **Restoring an older backup can lead to a second message.** Nothing compares the send log with the ledger. *Mitigation now:* the README's restore steps say to check by hand. *Fix:* proposal C.
-2. **The legal basis is unresolved.** The message is pending legal review. *Mitigation:* `ALLOW_LIVE` gate, defaults off, docs.
-3. **`sent_unconfirmed` may hide real sends, and `sent` may be a false positive.** Success detection is a heuristic: a new "תודה"/"thank you" text, or a thank/success redirect. Never retrying keeps send-once intact, but the counts can be wrong in either direction.
-4. **Hebrew can arrive garbled** on Windows-1255 sites, because the POST is always UTF-8. *Fix:* proposal A.
-5. **Hand-copying `ledger.db` without its `-wal` file loses claims.** *Mitigation:* README warning, the `backup` command, and the test that proves the risk.
-6. **Dependency drift:** unpinned versions (for example a tldextract public-suffix update) could change site keys or behavior. *Suggestion:* pin exact versions (a lock file) before live use.
-7. **One business with two domains** can get two messages. Inherent to per-site keys.
-8. **The robots.txt policy is stricter than your rule** for 401/403, redirects and large files. That's polite but loses some sites. *Fix:* proposal B.
-9. **Backups are not fsynced before the rename.** After power loss the newest backup could be incomplete. Low.
-10. **Two concurrent `send` runs** cost one extra GET per site and confuse the dashboard's run status. Send-once still holds (tested).
-11. **`reopen` has nothing to act on** until no-POST outcomes are recorded. See 10.3.
+1. **The legal basis is unresolved.** The message is pending legal review. *Mitigation:* `ALLOW_LIVE` gate, defaults off, docs.
+2. **`sent_unconfirmed` may hide real sends, and `sent` may be a false positive.** Success detection is a heuristic: a new "תודה"/"thank you" text, or a thank/success redirect. Never retrying keeps send-once intact, but the counts can be wrong in either direction.
+3. **`pending` rows need a human.** After an unexpected error or a crash between the claim and the result, the row stays `pending` and a message may or may not have been sent. The dashboard and `status` show them; nothing resolves them automatically.
+4. **Losing everything at once.** If the ledger, every backup and the send log are all lost, the tool would start fresh and could contact everyone again. *Mitigation:* `OFFSITE_BACKUP_DIR`.
+5. **Hand-copying `ledger.db` without its `-wal` file loses claims.** *Mitigation:* README warning, the `backup` command, the proving test, and the send-log consistency check (C), which now catches the result if the send log survived.
+6. **One business with two domains** can get two messages. Inherent to per-site keys.
+7. **Upgrading a pinned package** could still change site keys. Pins make this a deliberate act; the lock file comments tell you to re-run the tests and review section 3 first.
+8. **Backups are not fsynced before the rename.** After power loss the newest backup could be incomplete. Low.
+9. **Two concurrent `send` runs** cost one extra GET per site and confuse the dashboard's run status. Send-once still holds (tested).
+10. **Sites recorded as `no_form`/`captcha`/... stay skipped** until someone runs `reopen`, even if the site later adds a usable form. That is the intended trade-off: politeness over reach.
+
+## 13. Owner decisions applied after the audit
+
+- **Proposals A, B (+429), C:** applied; see sections 10 and 11.
+- **reopen wiring:** see section 10.3.
+- **Per-site error guard** (`send.py`, `_Run._send_one`, `except Exception` at line 281):
+  - What it covers: everything after a successful claim, from the send-log "claimed" line through the POST, verify, finish and the send-log "result" line.
+  - On any unexpected `Exception`: an `error` event is logged (saying whether the POST was attempted), the row is left as it is (pending unless finish already ran), the site counts as a breaker failure, and the run continues with the next site.
+  - It cannot re-enter the POST, and nothing is retried. `BaseException` (process kill, Ctrl+C) is not caught, so the crash tests behave as before.
+  - Tests: `test_exception_after_the_post_leaves_row_pending_and_run_continues`, `test_exception_inside_verify_leaves_row_pending_and_run_continues`, `test_exception_after_claim_before_post_makes_no_post`, `test_unexpected_errors_count_for_the_breaker`.
+- **Suppression lookup with platform-aware keys** (`ledger.is_suppressed`, line 297):
+  - `_send_one`, `dry-run` and `ingest` all call it with the **site key**, never the bare `domain` column. For platform sites that column is `facebook.com`, which would have matched every page on facebook.
+  - It was already correct for `facebook.com/<page>`, `profile.php?id=`, `*.blogspot.com` and normal domains.
+  - **One gap was found and fixed:** suppressing a wix account host (`user.wixsite.com`) did not block that account's sites (`user.wixsite.com/shop`). For keys with a path, the host part is now checked too.
+  - A bare platform such as `facebook.com` can never be suppressed, so one suppression can never block other businesses on the platform.
+  - Tests: `test_suppression_with_platform_aware_keys`, `test_a_bare_platform_can_never_be_suppressed`, `test_suppressed_platform_account_is_not_sent`.
+- **Pinned dependencies:** exact pins in `pyproject.toml`; every package (direct and transitive) pinned in `requirements.lock`. `tests/test_dependencies.py` fails if `pyproject.toml` and the lock disagree, or if the installed tldextract (whose bundled suffix list decides site keys) differs from the pin.

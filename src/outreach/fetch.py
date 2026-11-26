@@ -3,8 +3,8 @@
 - Honest User-Agent (USER_AGENT).
 - robots.txt fetched once per host (scheme + host + port) and cached; a
   disallowed URL is never requested and yields `robots_blocked`.
-  robots.txt answering 401/403 or 5xx, or not reachable, is treated as
-  "disallow everything" (conservative). 404 and other 4xx mean "allow".
+  robots.txt means "disallow everything" only on a network error, a 5xx
+  answer or 429; any other 4xx (404/410 missing, 401/403, ...) means "allowed".
 - Minimum delay between two requests to the same host (from config).
 - Sequential: one request at a time per Fetcher (a lock), no concurrency.
 - 15 s timeout, body capped at 2 MB (declared or streamed), at most 3
@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import codecs
 import re
 import threading
 import time
@@ -53,6 +54,7 @@ class FetchResult:
     text: str = ""
     detail: str = ""
     redirects: list[str] = field(default_factory=list)
+    encoding: str = "utf-8"  # the codec the body was decoded with
 
     @property
     def ok(self) -> bool:
@@ -90,6 +92,25 @@ class _RobotsPolicy:
 
 def decode_body(body: bytes, content_type: str | None) -> str:
     """Decode an HTML body, getting Hebrew legacy encodings right."""
+    return decode_body_with_encoding(body, content_type)[0]
+
+
+def normalize_charset(name: str | None) -> str | None:
+    """Python codec name for an HTML/HTTP charset label, or None if unknown."""
+    if not name:
+        return None
+    label = name.strip().strip("\"'").lower()
+    if label in _HEBREW_ALIASES:
+        return "cp1255"
+    try:
+        codec = codecs.lookup(label).name
+    except LookupError:
+        return None
+    return "utf-8" if codec in ("utf-8-sig", "utf_8") else codec
+
+
+def decode_body_with_encoding(body: bytes, content_type: str | None) -> tuple[str, str]:
+    """(text, codec used). Same rules as decode_body."""
     candidates: list[str] = []
     m = re.search(r"charset=[\"']?([\w.:-]+)", content_type or "", re.I)
     if m:
@@ -101,15 +122,17 @@ def decode_body(body: bytes, content_type: str | None) -> str:
     if body.startswith(b"\xef\xbb\xbf"):
         candidates.insert(0, "utf-8-sig")
     for enc in candidates:
-        enc = "cp1255" if enc.lower() in _HEBREW_ALIASES else enc
+        codec = "utf-8-sig" if enc == "utf-8-sig" else normalize_charset(enc)
+        if codec is None:
+            continue
         try:
-            return body.decode(enc)
+            return body.decode(codec), "utf-8" if codec == "utf-8-sig" else codec
         except (LookupError, UnicodeDecodeError):
             continue
     try:
-        return body.decode("utf-8")
+        return body.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
-        return body.decode("cp1255", errors="replace")
+        return body.decode("cp1255", errors="replace"), "cp1255"
 
 
 def _host_key(url: str) -> str:
@@ -204,8 +227,8 @@ class Fetcher:
             if raw.status >= 400:
                 return FetchResult(url, current, FETCH_ERROR, raw.status, ctype, redirects=redirects,
                                    detail=f"HTTP {raw.status}")
-            return FetchResult(url, current, OK, raw.status, ctype, decode_body(raw.body, ctype),
-                               redirects=redirects)
+            text, encoding = decode_body_with_encoding(raw.body, ctype)
+            return FetchResult(url, current, OK, raw.status, ctype, text, redirects=redirects, encoding=encoding)
         raise AssertionError("unreachable")
 
     def _wait_for_host(self, url: str) -> None:
@@ -217,20 +240,26 @@ class Fetcher:
                 self._sleep(wait)
         self._last_request[host] = self._clock()
 
-    def _request(self, url: str) -> _Raw:
-        """Exactly one GET attempt. Raises _RequestFailed on any error."""
+    def _request(self, url: str, truncate: bool = False) -> _Raw:
+        """Exactly one GET attempt. Raises _RequestFailed on any error.
+
+        A body over the cap raises, or with truncate=True is cut at the cap (used for robots.txt).
+        """
         self._wait_for_host(url)
         self.requested.append(url)
         try:
             with self._client.stream("GET", url) as resp:
                 declared = resp.headers.get("content-length")
-                if declared and declared.isdigit() and int(declared) > self.max_bytes:
+                if declared and declared.isdigit() and int(declared) > self.max_bytes and not truncate:
                     raise _RequestFailed(f"response too large: {declared} bytes declared (cap {self.max_bytes})")
                 chunks, total = [], 0
                 for chunk in resp.iter_bytes():
                     total += len(chunk)
                     if total > self.max_bytes:
-                        raise _RequestFailed(f"response too large: more than {self.max_bytes} bytes")
+                        if not truncate:
+                            raise _RequestFailed(f"response too large: more than {self.max_bytes} bytes")
+                        chunks.append(chunk[: len(chunk) - (total - self.max_bytes)])
+                        break
                     chunks.append(chunk)
                 return _Raw(resp.status_code, resp.headers, b"".join(chunks))
         except httpx.TimeoutException:
@@ -247,27 +276,32 @@ class Fetcher:
         return policy
 
     def _fetch_robots(self, host_key: str) -> _RobotsPolicy:
+        """robots.txt policy for one host (RFC 9309).
+
+        "Disallow everything" only for: a network error (unreachable, timeout), a 5xx answer, or
+        429 Too Many Requests (a request to slow down, not a missing file). Every other 4xx
+        (404/410 missing, 401/403, ...) means "no rules": allowed.
+        Redirects are followed up to max_redirects hops, also to another host (only robots.txt is
+        read there); more hops than that is treated as "no robots.txt" (allowed). A body larger
+        than the cap is parsed up to the cap.
+        """
         current = f"{host_key}/robots.txt"
-        origin = registrable_domain(urlsplit(current).hostname or "")
         for _ in range(self.max_redirects + 1):
+            if urlsplit(current).scheme not in ("http", "https"):
+                return _RobotsPolicy(allow_all=True, detail=f"robots.txt redirects to a non-http URL: {current}")
             try:
-                raw = self._request(current)
+                raw = self._request(current, truncate=True)
             except _RequestFailed as e:
                 return _RobotsPolicy(disallow_all=True, detail=f"robots.txt not reachable: {e}")
             if raw.status in _REDIRECT_CODES and raw.headers.get("location"):
-                nxt = urljoin(current, raw.headers["location"])
-                if registrable_domain(urlsplit(nxt).hostname or "") != origin:
-                    return _RobotsPolicy(disallow_all=True, detail="robots.txt redirects to another domain")
-                current = nxt
+                current = urljoin(current, raw.headers["location"])
                 continue
-            if raw.status in (401, 403):
+            if raw.status >= 500 or raw.status == 429:
                 return _RobotsPolicy(disallow_all=True, detail=f"robots.txt answered HTTP {raw.status}")
             if 400 <= raw.status < 500:
-                return _RobotsPolicy(allow_all=True)
-            if raw.status >= 500:
-                return _RobotsPolicy(disallow_all=True, detail=f"robots.txt answered HTTP {raw.status}")
+                return _RobotsPolicy(allow_all=True, detail=f"robots.txt answered HTTP {raw.status}: no rules")
             parser = robotparser.RobotFileParser()
             parser.parse(raw.body.decode("utf-8", errors="replace").splitlines())
             parser.modified()  # can_fetch() answers False until the parser is marked as checked
             return _RobotsPolicy(parser=parser)
-        return _RobotsPolicy(disallow_all=True, detail="robots.txt: too many redirects")
+        return _RobotsPolicy(allow_all=True, detail="robots.txt: too many redirects, treated as missing")

@@ -900,7 +900,7 @@ def p2_preflight(step: int, state: dict) -> Result:
     for m in re.finditer(r'Check\("([a-z_]+)"', pf.read_text(encoding="utf-8-sig")):
         if m.group(1) not in order:
             order.append(m.group(1))
-    expected = ["stop_file", "ledger_integrity", "ledger_missing", "template", "sender_details"]
+    expected = ["stop_file", "ledger_integrity", "ledger_missing", "sendlog_consistency", "template", "sender_details"]
     integrity = _lines_matching(pf, r"PRAGMA integrity_check")
     live_only = _lines_matching(pf, r"if live:")
     ok, ev = _required(state, {
@@ -1397,8 +1397,9 @@ P5_MUTATIONS = [
              "        # Step 2: claim. Committed to disk before anything is sent.\n",
              "        outcome = _post_once(self.client, plan, payload)  # MUTATION: POST before claim\n"
              "        # Step 2: claim. Committed to disk before anything is sent.\n",
-             more=(("        self.fetcher.wait_turn(plan.action_url)\n        outcome = _post_once(self.client, plan, payload)\n",
-                    "        self.fetcher.wait_turn(plan.action_url)\n"),),
+             more=(("            self.fetcher.wait_turn(plan.action_url)\n            post_attempted = True\n"
+                    "            outcome = _post_once(self.client, plan, payload)\n",
+                    "            self.fetcher.wait_turn(plan.action_url)\n            post_attempted = True\n"),),
              tests=("tests/test_send.py",)),
     Mutation("(b) ALLOW_LIVE check removed", "src/outreach/send.py",
              '    return environ.get("ALLOW_LIVE") == "1"\n',
@@ -1702,19 +1703,55 @@ def p7_readme(step: int, state: dict) -> Result:
     return Result("P7.2", "PASS" if ok else "FAIL", ev)
 
 
+APPROVAL_RECORD = ROOT / "docs" / "proposals" / "APPROVED.md"
+# Each behavior change made after the audit must be owner-approved (recorded in APPROVAL_RECORD)
+# and proven by passing tests.
+APPROVED_CHANGES = {
+    "A-post-charset.patch": ["tests/test_charset.py::test_post_body_is_encoded_in_the_form_charset[",
+                             "tests/test_charset.py::test_form_charset_rules["],
+    "B-robots-status-rule.patch": ["tests/test_fetch.py::test_robots_429_means_disallow_and_page_is_not_requested",
+                                   "tests/test_fetch.py::test_robots_401_403_mean_allow_and_page_is_fetched[",
+                                   "tests/test_fetch.py::test_robots_404_means_allow_and_page_is_fetched",
+                                   "tests/test_fetch.py::test_robots_network_error_means_disallow",
+                                   "tests/test_fetch.py::test_robots_redirect_to_another_host_is_followed"],
+    "C-sendlog-ledger-check.patch": [
+        "tests/test_preflight.py::test_refuses_when_send_log_claims_are_missing_from_a_restored_ledger"],
+    "reopen wiring": ["tests/test_send.py::test_finished_batch_records_no_post_outcomes_without_any_request",
+                      "tests/test_send.py::test_recorded_outcome_can_be_reopened_and_planned_again",
+                      "tests/test_send.py::test_halted_by_breaker_records_nothing",
+                      "tests/test_send.py::test_ready_site_skipped_at_send_time_is_not_recorded",
+                      "tests/test_ledger.py::test_record_no_post_outcomes_only_records_the_five_statuses"],
+    "per-site error guard": [
+        "tests/test_send.py::test_exception_after_the_post_leaves_row_pending_and_run_continues",
+        "tests/test_send.py::test_exception_inside_verify_leaves_row_pending_and_run_continues",
+        "tests/test_send.py::test_exception_after_claim_before_post_makes_no_post",
+        "tests/test_send.py::test_unexpected_errors_count_for_the_breaker"],
+    "suppression with platform keys": ["tests/test_ledger.py::test_suppression_with_platform_aware_keys",
+                                       "tests/test_ledger.py::test_a_bare_platform_can_never_be_suppressed",
+                                       "tests/test_send.py::test_suppressed_platform_account_is_not_sent"],
+    "pinned dependencies": ["tests/test_dependencies.py::test_every_direct_dependency_is_an_exact_pin_matching_the_lock",
+                            "tests/test_dependencies.py::test_tldextract_is_pinned_and_installed_at_the_pinned_version"],
+}
+
+
 def p7_no_behavior_change(step: int, state: dict) -> Result:
+    """Any behavior change since the audit commit must be owner-approved and proven by tests."""
     diff = _run(["git", "diff", "--stat", PROMPT6_COMMIT, "--", "src"]).stdout.strip()
-    untracked = [l for l in _run(["git", "status", "--porcelain", "-uall", "--", "src"]).stdout.splitlines()
-                 if l.startswith("??")]
-    patches = sorted((ROOT / "docs" / "proposals").glob("*.patch"))
-    applies = {}
-    for p in patches:
-        applies[p.name] = _run(["git", "apply", "--check", str(p)]).returncode == 0
-    ev = [f"`git diff {PROMPT6_COMMIT} -- src` (committed + working tree): {diff or 'empty'}",
-          f"untracked files in src/: {untracked or 'none'}",
-          f"behavior changes kept as proposals, not applied: {[p.name for p in patches]}",
-          f"each proposal applies cleanly (git apply --check): {applies}"]
-    ok = not diff and not untracked and len(patches) == 3 and all(applies.values())
+    patches = sorted(p.name for p in (ROOT / "docs" / "proposals").glob("*.patch"))
+    ev = [f"`git diff {PROMPT6_COMMIT} -- src`: {diff.splitlines()[-1].strip() if diff else 'empty'}",
+          f"proposal diffs shown to the owner before any change: {patches}"]
+    if not diff:
+        return Result("P7.3", "PASS" if len(patches) == 3 else "FAIL", ev + ["no behavior change in src/"])
+    record = APPROVAL_RECORD.read_text(encoding="utf-8-sig") if APPROVAL_RECORD.exists() else ""
+    ok = bool(record)
+    ev.append(f"owner approval record {_rel(APPROVAL_RECORD)}: {'present' if record else 'MISSING'}")
+    for change, tests in APPROVED_CHANGES.items():
+        listed = change in record
+        good, tev = _required(state, {f"{change} test {i + 1}": t for i, t in enumerate(tests)})
+        ok &= listed and good
+        ev.append(f"{change}: approved in record: {listed}; tests passed: {good}")
+        if not good:
+            ev += [f"  {t}" for t in tev]
     return Result("P7.3", "PASS" if ok else "FAIL", ev)
 
 

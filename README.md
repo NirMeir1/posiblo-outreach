@@ -8,13 +8,14 @@ The rules the code follows are in [CLAUDE.md](CLAUDE.md). The skeptical review o
 
 ## Setup
 
-Windows, Python 3.11 or newer.
+Windows, Python 3.11 or newer. All package versions are pinned (`pyproject.toml` and `requirements.lock`), so how URLs become site keys cannot change by accident. To upgrade a package, change both files and re-run the tests and `python scripts/validate.py --all`.
 
 ```powershell
 cd posiblo-outreach
 python -m venv .venv
 .venv\Scripts\Activate.ps1          # if blocked: Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-python -m pip install -e ".[dev]"
+python -m pip install -r requirements.lock   # exact, tested versions of every package
+python -m pip install -e . --no-deps
 python -m pytest -q                 # all tests use local servers only; nothing on the internet is contacted
 python -m outreach --help
 ```
@@ -57,7 +58,7 @@ Run every command from the project folder: relative paths and the `STOP` file ar
    ```powershell
    $env:ALLOW_LIVE = "1"; python -m outreach send B0001; Remove-Item Env:ALLOW_LIVE
    ```
-   `send` refuses unless all of these hold: `ALLOW_LIVE` is exactly `1`, the batch is approved, live preflight passes (no `STOP` file, ledger healthy, template present, no `TODO` in the sender details), and a fresh backup was just written. Then, for each approved site: it fetches the form again (fresh tokens), skips the site if the form changed since approval, claims the site in the ledger (committed to disk), writes "claimed" to the send log, POSTs **once**, checks for a success message, records `sent` or `sent_unconfirmed`, and writes "result" to the send log. Nothing is ever retried. A backup is written again at the end.
+   `send` refuses unless all of these hold: `ALLOW_LIVE` is exactly `1`, the batch is approved, live preflight passes (no `STOP` file, ledger healthy and consistent with the send log, template present, no `TODO` in the sender details), and a fresh backup was just written. Then, for each approved site: it fetches the form again (fresh tokens), skips the site if the form changed since approval, claims the site in the ledger (committed to disk), writes "claimed" to the send log, POSTs **once** (in the form's own charset), checks for a success message, records `sent` or `sent_unconfirmed`, and writes "result" to the send log. Nothing is ever retried. If anything unexpected goes wrong after the claim, the site is left `pending`, an event is logged and the run moves on to the next site. When the batch finishes, sites whose dry-run showed `no_form`, `captcha`, `login_required`, `robots_blocked` or `unclear_fields` are recorded in the ledger (no message, no request), so later batches skip them. A backup is written again at the end.
 
 6. **Review** afterwards: `python -m outreach status`, the dashboard, or `python -m outreach export B0001`.
    - `pending` rows: the run stopped between the claim and the result, so a message may or may not have been sent. They are never retried automatically. Check them by hand.
@@ -71,7 +72,7 @@ Other commands:
 | `python -m outreach backup` | Backs up the ledger (SQLite backup API), keeps the newest 30, also writes to `OFFSITE_BACKUP_DIR`. |
 | `python -m outreach suppress add <domain\|email\|phone> <value> [--reason TEXT]` | Never contact this domain, email or phone (works even while `STOP` exists). |
 | `python -m outreach clear-stop` | Removes the `STOP` file (type `CLEAR`). The dashboard cannot clear STOP. |
-| `python -m outreach reopen <site_key>` | Lets a site be planned again after `no_form`, `captcha`, `login_required`, `robots_blocked` or `unclear_fields` (no message was sent for those). Refused for every other status. Type the site key to confirm. See docs/audit.md: nothing records those statuses in the ledger yet. |
+| `python -m outreach reopen <site_key>` | Lets a site be planned again after `no_form`, `captcha`, `login_required`, `robots_blocked` or `unclear_fields` (recorded when its batch finished; no message was sent). Refused for every other status. Type the site key to confirm. |
 
 ## Settings
 
@@ -114,7 +115,7 @@ Settings come from environment variables or from `.env` in the project folder. A
   1. Stop everything. Create `STOP` if anything might be running.
   2. Delete `data/ledger.db-wal` and `data/ledger.db-shm` if they exist.
   3. Copy the **newest** backup, from `backups\` or from `OFFSITE_BACKUP_DIR`, to `data\ledger.db`.
-  4. Run `python -m outreach status` and compare it with `logs\send-log.jsonl`. Every site with a `claimed` line must be in the ledger. A backup older than the last send does not know about later sends. Today the tool does **not** check this automatically (proposal C in docs/audit.md adds that check).
+  4. Run `python -m outreach status`. Every write command now checks that every site with a `claimed` line in `logs\send-log.jsonl` is in the ledger. If you restored a backup older than the last send, they refuse and name the missing sites: restore a newer backup instead, or reconcile by hand.
   5. Run `python -m outreach clear-stop` when you are sure.
 - If all backups and the send log are lost too, the tool cannot know what was sent. Do not ingest the same CSV again.
 
@@ -123,7 +124,7 @@ Settings come from environment variables or from `.env` in the project folder. A
 - **Only static HTML is read.** Sites that build their contact form with JavaScript are recorded as `no_form`. There is no browser automation.
 - **No CAPTCHA, login or paywall handling**, by design. Those sites are recorded and skipped.
 - **Success detection is rule-based.** It looks for a success phrase that was not already on the form page, or a redirect to a thank-you/success URL. Everything else is `sent_unconfirmed`, which is never re-sent even if the message did arrive.
-- **The POST is always encoded in UTF-8.** Sites whose page or form declares Windows-1255 may receive garbled Hebrew (proposal A in docs/audit.md).
+- **robots.txt:** a missing file (404/410) or 401/403 means allowed; a network error, a 5xx answer or 429 means the whole site is skipped for this run.
 - **Platform URLs** (facebook.com/x, instagram.com/x, ...) normally have no usable form and robots.txt usually blocks them.
 - **One site key per registrable domain.** A business with two domains (e.g. `example.co.il` and `example.com`) counts as two sites.
 - **Legal questions are unresolved.** The message text is pending legal review (docs/message-template.md). Live sending must stay disabled until the owner confirms the lawyer has answered.

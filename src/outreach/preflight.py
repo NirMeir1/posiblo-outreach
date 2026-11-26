@@ -1,7 +1,7 @@
 """Checks that must pass before a command may touch the ledger or send.
 
-Order (fixed): STOP file, ledger integrity, missing-ledger guard, template,
-sender details (live mode only). All checks run; run_preflight() returns the
+Order (fixed): STOP file, ledger integrity, missing-ledger guard, send-log /
+ledger consistency, template, sender details (live mode only). All checks run; run_preflight() returns the
 list of failure messages (empty list = OK).
 """
 
@@ -73,12 +73,37 @@ def preflight_checks(config: Config, *, live: bool = False, require_no_stop: boo
     else:
         checks.append(Check("ledger_missing", True, "ledger present"))
 
-    # 4. Message template
+    # 4. Every site the send log says was claimed must be in the ledger. A ledger restored from a backup
+    #    older than the last send would otherwise "forget" those sites and could contact them again.
+    sendlog = SendLog(config.send_log_path)
+    if ledger.exists() and sendlog.exists():
+        try:
+            claimed = {r.get("site_key") for r in sendlog.read() if r.get("event") == "claimed" and r.get("site_key")}
+            conn = sqlite3.connect(f"{ledger.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                known = {row[0] for row in conn.execute("SELECT site_key FROM sites")}
+            finally:
+                conn.close()
+            missing = sorted(claimed - known)
+            if missing:
+                detail = (f"{len(missing)} site(s) claimed in the send log {sendlog.path} are MISSING from the ledger "
+                          f"(e.g. {', '.join(missing[:5])}). The ledger was probably restored from an older backup. "
+                          "Refusing to run: those sites could be contacted again. Restore a newer backup, or stop "
+                          "and reconcile the ledger with the send log by hand.")
+            else:
+                detail = f"all {len(claimed)} claimed site(s) in the send log are in the ledger"
+            checks.append(Check("sendlog_consistency", not missing, detail))
+        except (sqlite3.Error, OSError, ValueError) as e:
+            checks.append(Check("sendlog_consistency", False, f"could not compare the send log with the ledger: {e}"))
+    else:
+        checks.append(Check("sendlog_consistency", True, "nothing to compare"))
+
+    # 5. Message template
     tpl = config.template_path
     checks.append(Check("template", tpl.is_file(),
                         f"template {tpl} found" if tpl.is_file() else f"template {tpl} is missing"))
 
-    # 5. Sender details (live mode only)
+    # 6. Sender details (live mode only)
     if live:
         bad = config.sender_placeholders()
         checks.append(Check("sender_details", not bad,

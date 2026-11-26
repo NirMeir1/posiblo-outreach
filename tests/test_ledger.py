@@ -271,6 +271,60 @@ def test_suppressed_email_and_phone(ledger: Ledger) -> None:
     assert not ledger.is_suppressed("phone", "052-251-8188")
 
 
+def test_suppression_with_platform_aware_keys(ledger: Ledger) -> None:
+    # facebook: one page suppressed, another page on the platform is not
+    ledger.add_suppression("domain", "https://www.facebook.com/Bakery/")
+    assert ledger.is_suppressed("domain", "facebook.com/bakery")
+    assert ledger.is_suppressed("domain", "https://m.facebook.com/bakery?ref=x")
+    assert not ledger.is_suppressed("domain", "facebook.com/other")
+    ledger.add_suppression("domain", "https://www.facebook.com/profile.php?id=42")
+    assert ledger.is_suppressed("domain", "facebook.com/profile.php?id=42")
+    assert not ledger.is_suppressed("domain", "facebook.com/profile.php?id=43")
+    # wixsite: suppressing the account host blocks every site under it; a site suppression blocks only that site
+    ledger.add_suppression("domain", "https://user.wixsite.com/")
+    assert ledger.is_suppressed("domain", "user.wixsite.com/shop")
+    assert ledger.is_suppressed("domain", "https://user.wixsite.com/other-site/contact")
+    assert not ledger.is_suppressed("domain", "someone.wixsite.com/shop")
+    ledger.add_suppression("domain", "https://second.wixsite.com/shop")
+    assert ledger.is_suppressed("domain", "second.wixsite.com/shop")
+    assert not ledger.is_suppressed("domain", "second.wixsite.com/blog")
+    # subdomain platform: the host is the key
+    ledger.add_suppression("domain", "mybiz.blogspot.com")
+    assert ledger.is_suppressed("domain", "https://mybiz.blogspot.com/p/contact.html")
+    assert not ledger.is_suppressed("domain", "other.blogspot.com")
+
+
+def test_a_bare_platform_can_never_be_suppressed(ledger: Ledger) -> None:
+    """Otherwise one suppression could block every business on facebook or wix."""
+    from outreach.normalize import InvalidUrl
+    for bare in ("facebook.com", "https://www.facebook.com/", "wixsite.com", "linktr.ee"):
+        with pytest.raises(InvalidUrl):
+            ledger.add_suppression("domain", bare)
+
+
+def test_record_no_post_outcomes_only_records_the_five_statuses(ledger: Ledger) -> None:
+    outcomes = {"ready-x.co.il": "ready", "nf.co.il": "no_form", "cap.co.il": "captcha",
+                "login.co.il": "login_required", "robots.co.il": "robots_blocked", "unc.co.il": "unclear_fields",
+                "fe.co.il": "fetch_error", "ns.co.il": "no_solicitation", "opt.co.il": "opted_out",
+                "ah.co.il": "already_handled", "sent-before.co.il": "captcha"}
+    ledger.create_batches([[{"site_key": k, "domain": k, "input_url": f"https://{k}/"} for k in outcomes]])
+    ledger.claim("sent-before.co.il", domain="sent-before.co.il", input_url="x")
+    ledger.finish("sent-before.co.il", "sent")
+    for k, o in outcomes.items():
+        ledger.add_dry_run_result("B0001", k, o, f"https://{k}/contact", "{}", "detail")
+    recorded = dict(ledger.record_no_post_outcomes("B0001"))
+    assert recorded == {"nf.co.il": "no_form", "cap.co.il": "captcha", "login.co.il": "login_required",
+                        "robots.co.il": "robots_blocked", "unc.co.il": "unclear_fields"}
+    assert ledger.get("ready-x.co.il") is None                       # a ready site is never recorded
+    for k in ("fe.co.il", "ns.co.il", "opt.co.il", "ah.co.il"):
+        assert ledger.get(k) is None
+    assert ledger.get("sent-before.co.il")["status"] == "sent"       # existing row untouched
+    assert ledger.list_pending() == []                               # never pending
+    assert ledger.record_no_post_outcomes("B0001") == []             # idempotent
+    for k in recorded:
+        assert ledger.get(k)["form_url"] is None and ledger.get(k)["finished_at"]
+
+
 def test_suppression_rejects_bad_kind_or_value(ledger: Ledger) -> None:
     with pytest.raises(ValueError):
         ledger.add_suppression("fax", "123")

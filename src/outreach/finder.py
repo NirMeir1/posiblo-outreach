@@ -178,12 +178,13 @@ def _js_only_hint(soup: BeautifulSoup) -> str:
     return ""
 
 
-def _evaluate_form(form: Tag, html: str, page_url: str, start_url: str, pages: list[str]) -> FindResult:
+def _evaluate_form(form: Tag, html: str, page_url: str, start_url: str, pages: list[str],
+                   page_encoding: str | None = None) -> FindResult:
     marker = captcha_marker(html)
     if marker:
         return FindResult(CAPTCHA, start_url, page_url, None, f"CAPTCHA on the form page ({marker}); skipped",
                           pages)
-    result = build_plan(form, page_url)
+    result = build_plan(form, page_url, page_encoding)
     if result.status != READY:
         return FindResult(UNCLEAR, start_url, page_url, result.plan, result.detail, pages)
     return FindResult(READY, start_url, page_url, result.plan, "", pages)
@@ -206,7 +207,7 @@ def find_contact_form(start_url: str, fetcher: FetcherLike, max_extra_fetches: i
     soup = _soup(home.text)
     form, notes = choose_form(soup)
     if form is not None:
-        return _evaluate_form(form, home.text, home.url, start_url, pages)
+        return _evaluate_form(form, home.text, home.url, start_url, pages, home.encoding)
 
     seen = {_canon(home.url), _canon(start_url)}
     root = urlunsplit(urlsplit(home.url)[:2] + ("", "", ""))
@@ -241,7 +242,7 @@ def find_contact_form(start_url: str, fetcher: FetcherLike, max_extra_fetches: i
         excluded += notes
         hint = hint or _js_only_hint(psoup)
         if form is not None:
-            return _evaluate_form(form, page.text, page.url, start_url, pages)
+            return _evaluate_form(form, page.text, page.url, start_url, pages, page.encoding)
         if "login" in notes:
             login_seen = True
 

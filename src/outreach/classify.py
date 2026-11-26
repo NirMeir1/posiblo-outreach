@@ -21,6 +21,7 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import Tag
 
+from .fetch import normalize_charset
 from .normalize import registrable_domain
 
 READY = "ready"
@@ -82,6 +83,7 @@ class FormPlan:
     honeypots: list[str] = field(default_factory=list)
     ignored_optional: list[str] = field(default_factory=list)
     submit: tuple[str, str] | None = None
+    charset: str = "utf-8"  # how the browser would encode this form: accept-charset, else page encoding, else UTF-8
 
     def roles(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -94,7 +96,7 @@ class FormPlan:
 
     def summary(self) -> str:
         lines = [f"form page: {self.form_url}",
-                 f"submits to: {self.action_url} ({self.method.upper()}, {self.encoding})"]
+                 f"submits to: {self.action_url} ({self.method.upper()}, {self.encoding}, charset {self.charset})"]
         for f in self.fields:
             extra = f", {f.part}" if f.part else ""
             lines.append(f"  fill {f.name!r} as {f.role}{extra}{' (required)' if f.required else ''}"
@@ -210,11 +212,23 @@ def classify_field(el: Tag, label: str) -> tuple[str, str | None] | None:
     return None
 
 
-def build_plan(form: Tag, page_url: str) -> PlanResult:
+def form_charset(form: Tag, page_encoding: str | None) -> str:
+    """The charset a browser would submit this form in (HTML spec order)."""
+    raw = form.get("accept-charset", "")
+    raw = " ".join(raw) if isinstance(raw, list) else str(raw)  # BeautifulSoup returns a list for this attribute
+    for label in re.split(r"[\s,]+", raw):
+        codec = normalize_charset(label)
+        if codec:
+            return codec
+    return normalize_charset(page_encoding) or "utf-8"
+
+
+def build_plan(form: Tag, page_url: str, page_encoding: str | None = None) -> PlanResult:
     method = str(form.get("method", "get")).strip().lower() or "get"
     encoding = str(form.get("enctype", "")).strip().lower() or "application/x-www-form-urlencoded"
     action = urljoin(page_url, str(form.get("action", "")).strip() or page_url)
-    plan = FormPlan(form_url=page_url, action_url=action, method=method, encoding=encoding)
+    plan = FormPlan(form_url=page_url, action_url=action, method=method, encoding=encoding,
+                    charset=form_charset(form, page_encoding))
 
     a, p = urlsplit(action), urlsplit(page_url)
     if a.scheme not in ("http", "https"):

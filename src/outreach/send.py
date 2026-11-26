@@ -19,6 +19,13 @@ Per approved site, in this exact order (_send_one):
   6. send log "result" (fsync); update the circuit breaker.
 No retry after a POST attempt. Problems BEFORE the claim leave the site
 unclaimed (an event is logged), so it can be planned in a future batch.
+Any unexpected error AFTER the claim (also inside verify or finish) is caught
+per site: an event is logged, the row stays as it is (pending unless finish
+already ran), the breaker counts a failure, and the run goes on to the next
+site. Nothing is retried and there is never a second POST.
+When the batch finishes (not halted), its dry-run outcomes no_form, captcha,
+login_required, robots_blocked and unclear_fields are recorded in the ledger
+with no POST (never a ready site), so `reopen` can release them later.
 After the run (complete or halted) a backup is created.
 """
 
@@ -52,6 +59,7 @@ _REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 SENT = "sent"
 SENT_UNCONFIRMED = "sent_unconfirmed"
+ERROR = "error"  # unexpected error after the claim; the ledger row is left as it is (normally pending)
 
 
 def live_allowed(environ: Mapping[str, str]) -> bool:
@@ -77,6 +85,7 @@ class SendReport:
     sites: list[SiteSend] = field(default_factory=list)
     halted_reason: str | None = None
     backup: str | None = None
+    recorded: list[tuple[str, str]] = field(default_factory=list)  # no-POST outcomes recorded at the end
 
 
 @dataclass
@@ -99,6 +108,7 @@ def plan_signature(plan: FormPlan | dict) -> dict:
         "fields": sorted((f["name"], f["role"], f.get("part"), bool(f["required"])) for f in d["fields"]),
         "hidden": sorted(d.get("hidden_fields", {})),
         "honeypots": sorted(d.get("honeypots", [])),
+        "charset": d.get("charset", "utf-8"),
     }
 
 
@@ -146,13 +156,18 @@ def build_payload(plan: FormPlan, config: Config, message: str) -> list[tuple[st
 # --- the single POST --------------------------------------------------------
 
 def _post_once(client: httpx.Client, plan: FormPlan, pairs: list[tuple[str, str]]) -> PostOutcome:
-    """THE ONLY HTTP POST IN THIS CODEBASE. Exactly one attempt; never retried; never raises for HTTP errors."""
+    """THE ONLY HTTP POST IN THIS CODEBASE. Exactly one attempt; never retried; never raises for HTTP errors.
+
+    Values are encoded in the form's charset (accept-charset, else the page encoding, else UTF-8), like a
+    browser; characters the charset cannot represent become HTML character references (&#NNNN;).
+    """
+    charset = plan.charset or "utf-8"
     origin = "{0.scheme}://{0.netloc}".format(urlsplit(plan.form_url))
     headers = {"Referer": plan.form_url, "Origin": origin}
     if plan.encoding == "multipart/form-data":
-        kwargs = {"files": [(k, (None, v.encode("utf-8"))) for k, v in pairs]}
+        kwargs = {"files": [(k, (None, v.encode(charset, "xmlcharrefreplace"))) for k, v in pairs]}
     else:
-        kwargs = {"content": urlencode(pairs, encoding="utf-8").encode("ascii")}
+        kwargs = {"content": urlencode(pairs, encoding=charset, errors="xmlcharrefreplace").encode("ascii")}
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     try:
         with client.stream("POST", plan.action_url, headers=headers, **kwargs) as resp:
@@ -222,7 +237,7 @@ class _Run:
         marker = captcha_marker(page.text)
         if marker:
             return self._skip(key, f"form page now has a CAPTCHA ({marker})")
-        rebuilt = build_plan(form, page.url)
+        rebuilt = build_plan(form, page.url, page.encoding)
         if rebuilt.status != READY or rebuilt.plan is None:
             return self._skip(key, f"form no longer usable: {rebuilt.detail}")
         plan = rebuilt.plan
@@ -239,23 +254,43 @@ class _Run:
                                  source_url=page.url):
             return self._skip(key, "claim refused: the site is already in the ledger")
 
-        # Step 3: send log "claimed" (flushed + fsynced).
-        self.sendlog.append(EVENT_CLAIMED, site_key=key, batch_id=self.batch_id, form_url=site["form_url"],
-                            action_url=plan.action_url, message_version=self.version)
+        # From here on the site is claimed. Any unexpected error (before or after the POST, including in
+        # verify or finish) leaves the row as it is (pending unless finish already ran), is logged as an
+        # event, counts as a failure for the breaker, and the run continues with the next site.
+        # There is no retry and no second POST: this block runs once per claimed site.
+        post_attempted = False
+        try:
+            # Step 3: send log "claimed" (flushed + fsynced).
+            self.sendlog.append(EVENT_CLAIMED, site_key=key, batch_id=self.batch_id, form_url=site["form_url"],
+                                action_url=plan.action_url, message_version=self.version)
 
-        # Step 4: the one POST. No retry, whatever happens.
-        self.fetcher.wait_turn(plan.action_url)
-        outcome = _post_once(self.client, plan, payload)
+            # Step 4: the one POST. No retry, whatever happens.
+            self.fetcher.wait_turn(plan.action_url)
+            post_attempted = True
+            outcome = _post_once(self.client, plan, payload)
 
-        # Step 5: verify and finish.
-        status, detail = verify(outcome, page.text)
-        self.ledger.finish(key, status, detail)
+            # Step 5: verify and finish.
+            status, detail = verify(outcome, page.text)
+            self.ledger.finish(key, status, detail)
 
-        # Step 6: send log "result" (flushed + fsynced).
-        self.sendlog.append(EVENT_RESULT, site_key=key, batch_id=self.batch_id, status=status, detail=detail)
-        self.ledger.add_event("info" if status == SENT else "warning", f"send {self.batch_id}: {status}: {detail}",
-                              site_key=key)
-        return SiteSend(key, status, detail, posted=True)
+            # Step 6: send log "result" (flushed + fsynced).
+            self.sendlog.append(EVENT_RESULT, site_key=key, batch_id=self.batch_id, status=status, detail=detail)
+            self.ledger.add_event("info" if status == SENT else "warning",
+                                  f"send {self.batch_id}: {status}: {detail}", site_key=key)
+            return SiteSend(key, status, detail, posted=True)
+        except Exception as e:  # noqa: BLE001 - by design: one site's failure must not stop the batch
+            try:
+                row = self.ledger.get(key)
+                state = row["status"] if row else "missing"
+            except Exception:  # noqa: BLE001 - reporting only
+                state = "unknown (ledger not readable)"
+            detail = (f"unexpected error after the claim ({'POST was attempted' if post_attempted else 'no POST made'}"
+                      f"): {type(e).__name__}: {e}; ledger row is {state}; not retried")
+            try:
+                self.ledger.add_event("error", f"send {self.batch_id}: error: {detail}", site_key=key)
+            except Exception:  # noqa: BLE001 - the event is best effort; the row itself is what matters
+                pass
+            return SiteSend(key, ERROR, detail, posted=post_attempted)
 
     def _status(self, state: str, index: int, total: int, site_key: str | None, breaker: CircuitBreaker,
                 halted_reason: str | None = None) -> None:
@@ -272,7 +307,7 @@ class _Run:
             r = self._send_one(site)
             report.sites.append(r)
             self.out(f"[{i}/{len(sites)}] {r.site_key}  {r.result.upper()}  {r.detail}")
-            if r.result in (SENT_UNCONFIRMED, "fetch_error"):
+            if r.result in (SENT_UNCONFIRMED, "fetch_error", ERROR):
                 if breaker.record_failure():
                     report.halted_reason = (f"circuit breaker tripped after {breaker.consecutive_failures} "
                                             "consecutive failures")
@@ -333,6 +368,18 @@ def run_send(config: Config, ledger: Ledger, batch_id: str, *, environ: Mapping[
         if completed and not report.halted_reason:
             ledger.finish_send(batch_id)
             ledger.add_event("info", f"send {batch_id} finished")
+            # The batch is finished: record its no-POST dry-run outcomes (never `ready` sites) so they are
+            # not re-planned and re-fetched in later batches. `reopen` can release them again.
+            try:
+                report.recorded = ledger.record_no_post_outcomes(batch_id)
+                if report.recorded:
+                    ledger.add_event("info", f"send {batch_id}: recorded {len(report.recorded)} no-POST outcome(s) "
+                                             f"from the dry-run: {report.recorded}")
+                    out(f"recorded {len(report.recorded)} site(s) where nothing could be sent "
+                        f"(no message): {', '.join(f'{k}={s}' for k, s in report.recorded)}")
+            except Exception as e:  # noqa: BLE001 - must not prevent the closing backup
+                ledger.add_event("error", f"send {batch_id}: recording no-POST outcomes failed: {e}")
+                out(f"RECORDING NO-POST OUTCOMES FAILED: {e}")
         else:
             ledger.add_event("error", f"send {batch_id} halted: {report.halted_reason or 'unexpected error'}")
             if not completed:

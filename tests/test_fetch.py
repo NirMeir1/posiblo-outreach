@@ -69,8 +69,8 @@ def test_robots_fetched_once_per_host(httpserver: HTTPServer, fetcher: Fetcher) 
     assert paths(httpserver).count("/robots.txt") == 1
 
 
-@pytest.mark.parametrize(("status", "allowed"), [(404, True), (410, True), (401, False), (403, False),
-                                                 (500, False), (503, False)])
+@pytest.mark.parametrize(("status", "allowed"), [(404, True), (410, True), (401, True), (403, True), (400, True),
+                                                 (429, False), (500, False), (502, False), (503, False)])
 def test_robots_status_handling(httpserver: HTTPServer, fetcher: Fetcher, status: int, allowed: bool) -> None:
     robots(httpserver, "", status=status)
     httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
@@ -231,12 +231,21 @@ def test_robots_404_means_allow_and_page_is_fetched(httpserver: HTTPServer, fetc
     assert paths(httpserver) == ["/robots.txt", "/contact"]
 
 
-@pytest.mark.parametrize("status", [429])
-def test_robots_429_is_currently_treated_as_allow(httpserver: HTTPServer, fetcher: Fetcher, status: int) -> None:
-    """Documents current behaviour (4xx other than 401/403 = allow). See docs/audit.md for the proposal."""
-    robots(httpserver, "", status=status)
+def test_robots_429_means_disallow_and_page_is_not_requested(httpserver: HTTPServer, fetcher: Fetcher) -> None:
+    """429 Too Many Requests on robots.txt is a request to slow down: treated like 5xx (owner's decision)."""
+    robots(httpserver, "slow down", status=429)
+    httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
+    r = fetcher.get(httpserver.url_for("/"))
+    assert r.outcome == ROBOTS_BLOCKED and "429" in r.detail
+    assert paths(httpserver) == ["/robots.txt"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_robots_401_403_mean_allow_and_page_is_fetched(httpserver: HTTPServer, fetcher: Fetcher, status: int) -> None:
+    robots(httpserver, "forbidden", status=status)
     httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
     assert fetcher.get(httpserver.url_for("/")).outcome == OK
+    assert paths(httpserver) == ["/robots.txt", "/"]
 
 
 @pytest.mark.parametrize(("encoding", "content_type", "meta"), [
@@ -285,3 +294,30 @@ def test_finder_extra_fetch_limit_on_live_server(httpserver: HTTPServer, fetcher
     assert r.status == "no_form"
     pages = [p for p in paths(httpserver) if p != "/robots.txt"]
     assert len(pages) == 4  # homepage + at most 3 extra
+
+
+def test_robots_redirect_to_another_host_is_followed(httpserver: HTTPServer, fetcher: Fetcher) -> None:
+    other = httpserver.url_for("/robots-elsewhere.txt").replace("127.0.0.1", "localhost")
+    httpserver.expect_request("/robots.txt").respond_with_data("", status=301, headers={"Location": other})
+    httpserver.expect_request("/robots-elsewhere.txt").respond_with_data("User-agent: *\nDisallow: /private\n")
+    httpserver.expect_request("/public").respond_with_data("ok", content_type="text/html")
+    assert fetcher.get(httpserver.url_for("/private")).outcome == ROBOTS_BLOCKED   # the target's rules apply
+    assert fetcher.get(httpserver.url_for("/public")).outcome == OK
+
+
+def test_robots_too_many_redirects_is_treated_as_missing(httpserver: HTTPServer, fetcher: Fetcher) -> None:
+    chain = ["/robots.txt", "/r1", "/r2", "/r3", "/r4"]
+    for a, b in zip(chain, chain[1:]):
+        httpserver.expect_request(a).respond_with_data("", status=302, headers={"Location": b})
+    httpserver.expect_request("/page").respond_with_data("ok", content_type="text/html")
+    r = fetcher.get(httpserver.url_for("/page"))
+    assert r.outcome == OK
+    assert "/r4" not in paths(httpserver)
+
+
+def test_oversized_robots_is_parsed_up_to_the_cap(httpserver: HTTPServer, fetcher: Fetcher) -> None:
+    body = "User-agent: *\nDisallow: /private\n" + "# padding\n" * (MAX_BODY_BYTES // 10 + 10)
+    httpserver.expect_request("/robots.txt").respond_with_data(body, content_type="text/plain")
+    httpserver.expect_request("/public").respond_with_data("ok", content_type="text/html")
+    assert fetcher.get(httpserver.url_for("/private")).outcome == ROBOTS_BLOCKED
+    assert fetcher.get(httpserver.url_for("/public")).outcome == OK

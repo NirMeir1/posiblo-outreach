@@ -108,7 +108,8 @@ def test_todo_sender_rejected_in_live_mode_only(project: Path) -> None:
 def test_checks_run_in_required_order(project: Path) -> None:
     cfg = _cfg(project)
     names = [c.name for c in preflight_checks(cfg, live=True)]
-    assert names == ["stop_file", "ledger_integrity", "ledger_missing", "template", "sender_details"]
+    assert names == ["stop_file", "ledger_integrity", "ledger_missing", "sendlog_consistency", "template",
+                     "sender_details"]
     assert [c.name for c in preflight_checks(cfg, live=False)][-1] == "template"
 
 
@@ -123,3 +124,24 @@ def test_all_failures_reported_in_order(project: Path) -> None:
     assert "MISSING" in failures[1]
     assert "template" in failures[2]
     assert "sender details" in failures[3]
+
+
+def test_refuses_when_send_log_claims_are_missing_from_a_restored_ledger(project: Path) -> None:
+    """Restore from a backup taken before the last send: the send log still knows the newer claims."""
+    import shutil
+    cfg = _cfg(project)
+    log = SendLog(cfg.send_log_path)
+    with Ledger(cfg.ledger_path) as led:
+        led.claim("a.co.il", domain="a.co.il", input_url="x")
+        log.append("claimed", site_key="a.co.il")
+        old_backup = create_backup(cfg).local
+        led.claim("b.co.il", domain="b.co.il", input_url="x")
+        log.append("claimed", site_key="b.co.il")
+    assert run_preflight(cfg) == []                       # consistent before the restore
+    for suffix in ("-wal", "-shm"):
+        Path(str(cfg.ledger_path) + suffix).unlink(missing_ok=True)
+    shutil.copyfile(old_backup, cfg.ledger_path)          # the operator restores the older backup
+    failures = run_preflight(cfg)
+    assert len(failures) == 1
+    assert "MISSING from the ledger" in failures[0] and "b.co.il" in failures[0]
+    assert run_preflight(cfg, live=True, require_no_stop=False)[0] == failures[0]

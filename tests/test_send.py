@@ -246,6 +246,182 @@ def test_send_refused_when_ledger_missing_but_send_log_exists(two) -> None:
     assert not cfg.ledger_path.exists()
 
 
+# --- unexpected errors after the claim (per-site guard) ----------------------
+
+def test_exception_after_the_post_leaves_row_pending_and_run_continues(two, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, led, sites = two
+    real_finish = Ledger.finish
+
+    def finish_fails_for_a(self, site_key, status, detail=None):
+        if site_key == key("a"):
+            raise RuntimeError("disk hiccup while finishing")
+        return real_finish(self, site_key, status, detail)
+
+    monkeypatch.setattr(Ledger, "finish", finish_fails_for_a)
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert [s.result for s in report.sites] == ["error", SENT]          # the run went on to site b
+    assert report.sites[0].posted is True and "POST was attempted" in report.sites[0].detail
+    assert len(sites.posts("a")) == 1 and len(sites.posts("b")) == 1    # exactly one POST each
+    assert led.get(key("a"))["status"] == "pending"                     # left for manual review
+    msgs = [r[0] for r in led._conn.execute("SELECT message FROM events WHERE site_key = ? AND level = 'error'",
+                                             (key("a"),))]
+    assert any("unexpected error after the claim" in m and "RuntimeError" in m for m in msgs)
+    monkeypatch.undo()
+    run_send(cfg, led, "B0001", environ=LIVE, **quiet())                 # rerun: no second POST for a
+    assert len(sites.posts("a")) == 1 and led.get(key("a"))["status"] == "pending"
+
+
+def test_exception_inside_verify_leaves_row_pending_and_run_continues(two, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, led, sites = two
+    real_verify = send_mod.verify
+    calls = []
+
+    def verify_fails_first(outcome, before_html):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("parser blew up on the response")
+        return real_verify(outcome, before_html)
+
+    monkeypatch.setattr(send_mod, "verify", verify_fails_first)
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert [s.result for s in report.sites] == ["error", SENT]
+    assert "ValueError" in report.sites[0].detail and report.sites[0].posted is True
+    assert len(sites.posts("a")) == 1 and len(sites.posts("b")) == 1
+    assert led.get(key("a"))["status"] == "pending"
+    events = [e["event"] for e in SendLog(cfg.send_log_path).read() if e["site_key"] == key("a")]
+    assert events == ["claimed"]                                         # no result line: outcome unknown
+
+
+def test_exception_after_claim_before_post_makes_no_post(two, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, led, sites = two
+    real_append = SendLog.append
+
+    def append_fails_for_a(self, event, **fields):
+        if event == "claimed" and fields.get("site_key") == key("a"):
+            raise OSError("log disk full")
+        return real_append(self, event, **fields)
+
+    monkeypatch.setattr(SendLog, "append", append_fails_for_a)
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert report.sites[0].result == "error" and report.sites[0].posted is False
+    assert "no POST made" in report.sites[0].detail
+    assert sites.posts("a") == [] and len(sites.posts("b")) == 1
+    assert led.get(key("a"))["status"] == "pending"
+
+
+def test_unexpected_errors_count_for_the_breaker(project: Path, httpserver: HTTPServer,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, led, sites = prepare(project, httpserver, ["a", "b", "c"], OUTREACH_BREAKER_THRESHOLD="2")
+
+    def always_fails(outcome, before_html):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(send_mod, "verify", always_fails)
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert "circuit breaker" in report.halted_reason
+    assert [s.result for s in report.sites] == ["error", "error"]
+    assert len(sites.posts()) == 2 and sites.posts("c") == [] and led.get(key("c")) is None
+    led.close()
+
+
+# --- recording no-POST outcomes when a batch finishes -------------------------
+
+def prepare_mixed(project: Path, server: HTTPServer, **env: str):
+    """Batch with one ready site (a), plus sites whose dry-run gives no_form, captcha and fetch_error."""
+    from conftest import fixture_html
+    sites = LocalSites(server, ["a"])
+    server.expect_request("/n/").respond_with_data(fixture_html("no_form.html"), content_type="text/html; charset=utf-8")
+    server.expect_request("/c/").respond_with_data(fixture_html("recaptcha.html"),
+                                                   content_type="text/html; charset=utf-8")
+    server.expect_request("/f/").respond_with_data("gone", status=404)
+    cfg = load_config(root=project, environ={"SENDER_ADDRESS": ADDRESS, "OUTREACH_HOST_DELAY_SECONDS": "0", **env})
+    led = Ledger(cfg.ledger_path)
+    led.create_batches([[{"site_key": key(n), "domain": "127.0.0.1", "input_url": server.url_for(f"/{n}/")}
+                         for n in ("a", "n", "c", "f")]])
+    with Fetcher(delay_seconds=0) as f:
+        assert run_dry_run(cfg, led, "B0001", fetcher=f, out=lambda s: None).completed
+    outcomes = {r["site_key"]: r["outcome"] for r in led.dry_run_results("B0001")}
+    assert outcomes == {key("a"): "ready", key("n"): "no_form", key("c"): "captcha", key("f"): "fetch_error"}
+    approve_batch(led, "B0001", ask=lambda p: "B0001", out=lambda s: None)
+    server.clear_log()
+    return cfg, led, sites
+
+
+def test_finished_batch_records_no_post_outcomes_without_any_request(project: Path, httpserver: HTTPServer) -> None:
+    cfg, led, sites = prepare_mixed(project, httpserver)
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert sorted(report.recorded) == sorted([(key("n"), "no_form"), (key("c"), "captcha")])
+    assert led.get(key("a"))["status"] == SENT                     # the ready site went through send, not this path
+    assert led.get(key("n"))["status"] == "no_form" and led.get(key("c"))["status"] == "captcha"
+    assert led.get(key("n"))["finished_at"] and "no message sent" in led.get(key("n"))["detail"]
+    assert led.get(key("f")) is None                               # fetch_error is not recorded: may work later
+    paths_requested = [r.path for r, _ in httpserver.log]
+    assert not any(p.startswith(("/n/", "/c/", "/f/")) for p in paths_requested)   # no request at all for them
+    assert len(sites.posts()) == 1
+    assert {e["site_key"] for e in SendLog(cfg.send_log_path).read()} == {key("a")}  # no send-log claims for them
+    from outreach.preflight import run_preflight
+    assert run_preflight(cfg, live=True) == []                     # send-log/ledger consistency still holds
+    led.close()
+
+
+def test_recorded_outcome_can_be_reopened_and_planned_again(project: Path, httpserver: HTTPServer,
+                                                            tmp_path: Path) -> None:
+    from outreach.ingest import ingest
+    from outreach.reopen import reopen_site
+    cfg, led, sites = prepare_mixed(project, httpserver)
+    run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    csv = tmp_path / "again.csv"
+    csv.write_text(f"url\nhttps://{key('n')}/\n", encoding="utf-8")
+    assert ingest(csv, led, batch_size=25).handled == 1             # recorded: not planned again by itself
+    assert reopen_site(led, key("n"), ask=lambda p: key("n"), out=lambda s: None) == "no_form"
+    assert ingest(csv, led, batch_size=25).planned == 1             # after reopen it can be planned again
+    led.close()
+
+
+def test_halted_by_breaker_records_nothing(project: Path, httpserver: HTTPServer,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg, led, sites = prepare_mixed(project, httpserver)                  # dry-run with the default breaker
+    send_cfg = load_config(root=project, environ={"SENDER_ADDRESS": ADDRESS, "OUTREACH_HOST_DELAY_SECONDS": "0",
+                                                  "OUTREACH_BREAKER_THRESHOLD": "1"})
+    sites.post_response["a"] = lambda req: Response("boom", status=500)   # sent_unconfirmed -> breaker trips
+    report = run_send(send_cfg, led, "B0001", environ=LIVE, **quiet())
+    assert "circuit breaker" in report.halted_reason
+    assert report.recorded == []
+    assert led.get(key("n")) is None and led.get(key("c")) is None
+    led.close()
+
+
+def test_ready_site_skipped_at_send_time_is_not_recorded(project: Path, httpserver: HTTPServer) -> None:
+    cfg, led, sites = prepare_mixed(project, httpserver)
+    sites.action["a"] = "/a/other"                                  # form changed since approval: skipped
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert report.sites[0].result == "skipped"
+    assert led.get(key("a")) is None                                # a ready site is never recorded
+    assert dict(report.recorded) == {key("n"): "no_form", key("c"): "captcha"}
+    led.close()
+
+
+# --- suppression with platform-aware keys ------------------------------------
+
+def test_suppressed_platform_account_is_not_sent(project: Path, httpserver: HTTPServer) -> None:
+    sites = LocalSites(httpserver, ["a", "b"])
+    cfg = load_config(root=project, environ={"SENDER_ADDRESS": ADDRESS, "OUTREACH_HOST_DELAY_SECONDS": "0"})
+    led = Ledger(cfg.ledger_path)
+    keys = {"a": "user.wixsite.com/shop", "b": "facebook.com/bakery"}
+    led.create_batches([[{"site_key": keys[n], "domain": "127.0.0.1", "input_url": sites.url(n)} for n in "ab"]])
+    with Fetcher(delay_seconds=0) as f:
+        run_dry_run(cfg, led, "B0001", fetcher=f, out=lambda s: None)
+    approve_batch(led, "B0001", ask=lambda p: "B0001", out=lambda s: None)
+    led.add_suppression("domain", "https://user.wixsite.com/")      # the whole account
+    led.add_suppression("domain", "https://www.facebook.com/OtherPage")  # a different facebook page
+    httpserver.clear_log()
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert report.sites[0].result == "skipped" and "suppression" in report.sites[0].detail
+    assert sites.posts("a") == [] and led.get(keys["a"]) is None
+    assert report.sites[1].result == SENT and len(sites.posts("b")) == 1   # other page on the platform: not blocked
+    led.close()
+
+
 # --- gates ----------------------------------------------------------------
 
 @pytest.mark.parametrize("environ", [{}, {"ALLOW_LIVE": ""}, {"ALLOW_LIVE": "0"}, {"ALLOW_LIVE": "true"},

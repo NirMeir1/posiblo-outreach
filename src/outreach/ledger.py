@@ -8,7 +8,8 @@ Send-once guarantees implemented here:
 - finish() is the only code that changes a site row, and only moves a
   `pending` row to a final status. reopen() is the only code that removes
   one, and only for statuses where no POST ever happened
-  (REOPENABLE_STATUSES).
+  (REOPENABLE_STATUSES). record_no_post_outcomes() inserts exactly those
+  statuses (final, never pending) for a finished batch's dry-run results.
 - Triggers refuse, at the database level, to delete rows whose status means a
   POST may have happened (pending, sent, sent_unconfirmed) or opted_out rows;
   to move any row back to pending; to change a sent/sent_unconfirmed row to
@@ -294,9 +295,21 @@ class Ledger:
         return cur.rowcount == 1
 
     def is_suppressed(self, kind: str, value: str) -> bool:
+        """True if the value (any spelling) is suppressed.
+
+        Domains are compared by site key, so a suppressed "www.example.co.il" also blocks
+        "shop.example.co.il". For platform keys that carry a path ("user.wixsite.com/shop",
+        "facebook.com/biz") the host part is checked too, so suppressing the account host
+        "user.wixsite.com" blocks every site under it. A bare platform such as "facebook.com"
+        can never be suppressed (normalize_url rejects it), so one page never blocks another.
+        """
         norm = normalize_suppression(kind, value)
+        candidates = {norm}
+        if kind == "domain" and "/" in norm:
+            candidates.add(norm.split("/", 1)[0])
+        marks = ", ".join("?" for _ in candidates)
         row = self._conn.execute(
-            "SELECT 1 FROM suppression WHERE kind = ? AND value = ?", (kind, norm)
+            f"SELECT 1 FROM suppression WHERE kind = ? AND value IN ({marks})", (kind, *sorted(candidates))
         ).fetchone()
         return row is not None
 
@@ -440,6 +453,42 @@ class Ledger:
     def finish_send(self, batch_id: str) -> None:
         self._conn.execute("UPDATE batches SET state = 'send_done' WHERE batch_id = ? AND state = 'sending'",
                            (batch_id,))
+
+    def record_no_post_outcomes(self, batch_id: str) -> list[tuple[str, str]]:
+        """Record a finished batch's dry-run outcomes where nothing can be sent, with no POST.
+
+        Only REOPENABLE_STATUSES (no_form, captcha, login_required, robots_blocked, unclear_fields)
+        are recorded; `ready` and every other outcome are never recorded here. Each row is written
+        directly with its final status in ONE INSERT ... ON CONFLICT DO NOTHING (never `pending`),
+        so a site already in the ledger is left untouched. `reopen` can remove these rows again.
+        Returns the (site_key, status) pairs that were recorded now.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT d.site_key, d.outcome, d.form_url, d.detail, s.domain, s.input_url "
+                "FROM dry_run_results d JOIN batch_sites s ON s.batch_id = d.batch_id AND s.site_key = d.site_key "
+                "WHERE d.batch_id = ? AND d.outcome IN "
+                "('no_form', 'captcha', 'login_required', 'robots_blocked', 'unclear_fields') "
+                "ORDER BY s.position", (batch_id,)).fetchall()
+            recorded: list[tuple[str, str]] = []
+            now = _now()
+            for r in rows:
+                assert r["outcome"] in REOPENABLE_STATUSES and r["outcome"] != "ready"
+                cur = conn.execute(
+                    "INSERT INTO sites (site_key, domain, input_url, form_url, status, batch_id, claimed_at, "
+                    "finished_at, detail) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (r["site_key"], r["domain"], r["input_url"], r["outcome"], batch_id, now, now,
+                     f"recorded from dry-run (no message sent): {r['detail'] or r['outcome']}"))
+                if cur.rowcount == 1:
+                    recorded.append((r["site_key"], r["outcome"]))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return recorded
 
     # -- reopen -----------------------------------------------------------
     def reopen(self, site_key: str) -> str:
