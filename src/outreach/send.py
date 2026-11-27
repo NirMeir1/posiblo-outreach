@@ -15,7 +15,8 @@ Per approved site, in this exact order (_send_one):
   2. claim(site_key): committed to disk before anything is sent; False -> skip;
   3. send log "claimed" (fsync);
   4. build the message and POST it ONCE (_post_once, the only POST in src/);
-  5. verify by rules -> finish(sent) or finish(sent_unconfirmed);
+  5. verify by rules -> finish(sent) or finish(sent_unconfirmed); an Elementor
+     form counts as sent only if Elementor's JSON reply says success=true;
   6. send log "result" (fsync); update the circuit breaker.
 No retry after a POST attempt. Problems BEFORE the claim leave the site
 unclaimed (an event is logged), so it can be planned in a future batch.
@@ -42,7 +43,7 @@ from bs4 import BeautifulSoup
 
 from .backup import BackupError, create_backup
 from .breaker import CircuitBreaker
-from .classify import READY, FormPlan, MappedField, build_plan
+from .classify import ELEMENTOR, ELEMENTOR_AJAX_ACTION, HTML_FORM, READY, FormPlan, MappedField, build_plan
 from .config import Config
 from .fetch import MAX_BODY_BYTES, TIMEOUT_SECONDS, USER_AGENT, Fetcher, decode_body
 from .finder import captcha_marker, choose_form, visible_text
@@ -109,6 +110,7 @@ def plan_signature(plan: FormPlan | dict) -> dict:
         "hidden": sorted(d.get("hidden_fields", {})),
         "honeypots": sorted(d.get("honeypots", [])),
         "charset": d.get("charset", "utf-8"),
+        "handler": d.get("handler", HTML_FORM),
     }
 
 
@@ -150,6 +152,9 @@ def build_payload(plan: FormPlan, config: Config, message: str) -> list[tuple[st
     pairs += [(name, "") for name in plan.honeypots]
     if plan.submit:
         pairs.append(plan.submit)
+    if plan.handler == ELEMENTOR:
+        # The two fields Elementor Pro's own script adds before it sends the form.
+        pairs += [("action", ELEMENTOR_AJAX_ACTION), ("referrer", plan.form_url)]
     return pairs
 
 
@@ -164,6 +169,8 @@ def _post_once(client: httpx.Client, plan: FormPlan, pairs: list[tuple[str, str]
     charset = plan.charset or "utf-8"
     origin = "{0.scheme}://{0.netloc}".format(urlsplit(plan.form_url))
     headers = {"Referer": plan.form_url, "Origin": origin}
+    if plan.handler == ELEMENTOR:
+        headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
     if plan.encoding == "multipart/form-data":
         kwargs = {"files": [(k, (None, v.encode(charset, "xmlcharrefreplace"))) for k, v in pairs]}
     else:
@@ -183,8 +190,29 @@ def _post_once(client: httpx.Client, plan: FormPlan, pairs: list[tuple[str, str]
         return PostOutcome(error=f"{type(e).__name__}: {e}")
 
 
-def verify(outcome: PostOutcome, before_html: str) -> tuple[str, str]:
+def verify_elementor(outcome: PostOutcome) -> tuple[str, str]:
+    """Elementor replies with JSON. Only {"success": true} counts as sent; anything else is sent_unconfirmed."""
+    if outcome.error:
+        return SENT_UNCONFIRMED, f"error during POST: {outcome.error}"
+    code = outcome.status_code or 0
+    if code != 200:
+        return SENT_UNCONFIRMED, f"HTTP {code} from Elementor's AJAX address"
+    try:
+        data = json.loads(outcome.text)
+    except ValueError:
+        return SENT_UNCONFIRMED, f"HTTP 200, Elementor reply is not JSON: {outcome.text[:80]!r}"
+    if isinstance(data, dict) and data.get("success") is True:
+        return SENT, "HTTP 200, Elementor replied success=true"
+    inner = data.get("data") if isinstance(data, dict) else None
+    msg = inner.get("message") if isinstance(inner, dict) else None
+    return SENT_UNCONFIRMED, ("Elementor did not confirm (success is not true)"
+                              + (f": {str(msg)[:120]!r}" if msg else f": {outcome.text[:80]!r}"))
+
+
+def verify(outcome: PostOutcome, before_html: str, handler: str = HTML_FORM) -> tuple[str, str]:
     """Rule-based success check. A phrase counts only if it was NOT already on the form page."""
+    if handler == ELEMENTOR:
+        return verify_elementor(outcome)
     if outcome.error:
         return SENT_UNCONFIRMED, f"error during POST: {outcome.error}"
     code = outcome.status_code or 0
@@ -270,7 +298,7 @@ class _Run:
             outcome = _post_once(self.client, plan, payload)
 
             # Step 5: verify and finish.
-            status, detail = verify(outcome, page.text)
+            status, detail = verify(outcome, page.text, plan.handler)
             self.ledger.finish(key, status, detail)
 
             # Step 6: send log "result" (flushed + fsynced).

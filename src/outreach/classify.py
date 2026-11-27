@@ -10,11 +10,17 @@ Roles: name, email, phone, subject, message, consent (checkbox), hidden.
   classifier never guesses.
 - The form must submit to the same registrable domain as the page, with
   method post and a normal encoding; otherwise `unclear_fields`.
+- Elementor Pro forms (class `elementor-form`) are not processed by a plain
+  POST to the page; Elementor's own script sends them to WordPress's
+  admin-ajax.php. For these the plan targets the AJAX address the page itself
+  states in `ElementorProFrontendConfig` ("ajaxurl"), never a guessed one; if
+  the page does not state it, the form is `unclear_fields`.
 This module only reads HTML. It never sends anything.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urljoin, urlsplit
@@ -26,6 +32,12 @@ from .normalize import registrable_domain
 
 READY = "ready"
 UNCLEAR = "unclear_fields"
+
+HTML_FORM = "html"        # a normal HTML form submission
+ELEMENTOR = "elementor"   # sent the way Elementor Pro's own script sends it (AJAX, JSON reply)
+ELEMENTOR_AJAX_ACTION = "elementor_pro_forms_send_form"
+_ELEMENTOR_CONFIG = "ElementorProFrontendConfig"
+_AJAXURL = re.compile(r'"ajaxurl"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 _HEB = "א-ת"
 
@@ -84,6 +96,7 @@ class FormPlan:
     ignored_optional: list[str] = field(default_factory=list)
     submit: tuple[str, str] | None = None
     charset: str = "utf-8"  # how the browser would encode this form: accept-charset, else page encoding, else UTF-8
+    handler: str = HTML_FORM  # HTML_FORM or ELEMENTOR
 
     def roles(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -97,6 +110,9 @@ class FormPlan:
     def summary(self) -> str:
         lines = [f"form page: {self.form_url}",
                  f"submits to: {self.action_url} ({self.method.upper()}, {self.encoding}, charset {self.charset})"]
+        if self.handler == ELEMENTOR:
+            lines.append(f"  Elementor form: sent like Elementor's own script (adds action={ELEMENTOR_AJAX_ACTION} "
+                         "and referrer; success only if the JSON reply says success=true)")
         for f in self.fields:
             extra = f", {f.part}" if f.part else ""
             lines.append(f"  fill {f.name!r} as {f.role}{extra}{' (required)' if f.required else ''}"
@@ -223,12 +239,44 @@ def form_charset(form: Tag, page_encoding: str | None) -> str:
     return normalize_charset(page_encoding) or "utf-8"
 
 
+def is_elementor_form(form: Tag) -> bool:
+    return "elementor-form" in [c.lower() for c in form.get("class", [])]
+
+
+def elementor_ajax_url(form: Tag) -> str | None:
+    """The "ajaxurl" that the page states in ElementorProFrontendConfig, or None. Never guessed."""
+    for script in _root(form).find_all("script"):
+        text = script.string or script.get_text() or ""
+        if _ELEMENTOR_CONFIG not in text:
+            continue
+        m = _AJAXURL.search(text[text.index(_ELEMENTOR_CONFIG):])
+        if m:
+            try:
+                url = json.loads(f'"{m.group(1)}"')  # undo JSON escaping such as https:\/\/
+            except ValueError:
+                return None
+            return url.strip() or None
+    return None
+
+
 def build_plan(form: Tag, page_url: str, page_encoding: str | None = None) -> PlanResult:
     method = str(form.get("method", "get")).strip().lower() or "get"
     encoding = str(form.get("enctype", "")).strip().lower() or "application/x-www-form-urlencoded"
     action = urljoin(page_url, str(form.get("action", "")).strip() or page_url)
     plan = FormPlan(form_url=page_url, action_url=action, method=method, encoding=encoding,
                     charset=form_charset(form, page_encoding))
+
+    if is_elementor_form(form):
+        names = {str(i.get("name")) for i in form.find_all("input", attrs={"type": "hidden"})}
+        if not {"post_id", "form_id"} <= names:
+            return PlanResult(UNCLEAR, plan, "Elementor form without its post_id/form_id fields")
+        ajax = elementor_ajax_url(form)
+        if ajax is None:
+            return PlanResult(UNCLEAR, plan, "Elementor form, but the page does not state Elementor's AJAX "
+                                             "address (ElementorProFrontendConfig ajaxurl); not guessed")
+        # Elementor's script sends the form as FormData: multipart, always UTF-8.
+        action = urljoin(page_url, ajax)
+        plan.action_url, plan.encoding, plan.charset, plan.handler = action, "multipart/form-data", "utf-8", ELEMENTOR
 
     a, p = urlsplit(action), urlsplit(page_url)
     if a.scheme not in ("http", "https"):

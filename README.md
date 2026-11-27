@@ -122,6 +122,7 @@ Settings come from environment variables or from `.env` in the project folder. A
 ## Known limits
 
 - **Only static HTML is read.** Sites that build their contact form with JavaScript are recorded as `no_form`. There is no browser automation.
+- **Elementor Pro forms** are not sent to the page itself (Elementor ignores a plain POST there). They are sent once to the AJAX address the page states in `ElementorProFrontendConfig` (`ajaxurl`), with the two fields Elementor's script adds (`action=elementor_pro_forms_send_form`, `referrer`). Only a JSON reply `{"success": true}` counts as `sent`; anything else is `sent_unconfirmed`. If the page does not state the address, the form is `unclear_fields`. **This has only been tested against a local imitation, not a real Elementor Pro installation.**
 - **No CAPTCHA, login or paywall handling**, by design. Those sites are recorded and skipped.
 - **Success detection is rule-based.** It looks for a success phrase that was not already on the form page, or a redirect to a thank-you/success URL. Everything else is `sent_unconfirmed`, which is never re-sent even if the message did arrive.
 - **robots.txt:** a missing file (404/410) or 401/403 means allowed; a 5xx answer or 429 means the site is skipped as `robots_blocked`. A network failure (no internet, DNS, timeout) is reported as `fetch_error` and, after `OUTREACH_BREAKER_THRESHOLD` failures in a row, stops the run so an outage cannot produce a batch of wrong results. Re-run the dry-run when the connection is back.

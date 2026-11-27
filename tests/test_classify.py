@@ -1,7 +1,7 @@
 from bs4 import BeautifulSoup
 
 from conftest import FIXTURES
-from outreach.classify import READY, UNCLEAR, build_plan
+from outreach.classify import ELEMENTOR, HTML_FORM, READY, UNCLEAR, build_plan
 from outreach.finder import choose_form
 
 PAGE = "https://www.example.co.il/contact/"
@@ -41,7 +41,56 @@ def test_elementor_form() -> None:
     assert roles(r.plan) == {"form_fields[name]": "name", "form_fields[email]": "email",
                              "form_fields[field_phone]": "phone", "form_fields[message]": "message"}
     assert set(r.plan.hidden_fields) == {"post_id", "form_id", "referer_title", "queried_id"}
-    assert r.plan.action_url == PAGE  # no action attribute: posts to the page itself
+    # Not the page itself: Elementor handles the form only at the AJAX address the page states.
+    assert r.plan.action_url == "https://www.example.co.il/wp-admin/admin-ajax.php"
+    assert r.plan.handler == ELEMENTOR
+    assert r.plan.encoding == "multipart/form-data" and r.plan.charset == "utf-8"
+    assert "Elementor form" in r.plan.summary()
+
+
+def elementor_html(config: str | None) -> str:
+    html = (FIXTURES / "elementor.html").read_text(encoding="utf-8")
+    start = html.index('<script id="elementor-pro-frontend-js-before">')
+    end = html.index("</script>", start) + len("</script>")
+    return html[:start] + (f"<script>{config}</script>" if config is not None else "") + html[end:]
+
+
+def plan_for_html(html: str, page_url: str = PAGE):
+    form, _ = choose_form(BeautifulSoup(html, "lxml"))
+    assert form is not None
+    return build_plan(form, page_url)
+
+
+def test_elementor_absolute_escaped_ajaxurl_as_real_sites_print_it() -> None:
+    cfg = 'var ElementorProFrontendConfig = {"ajaxurl":"https:\\/\\/www.example.co.il\\/wp-admin\\/admin-ajax.php"};'
+    r = plan_for_html(elementor_html(cfg))
+    assert r.status == READY, r.detail
+    assert r.plan.action_url == "https://www.example.co.il/wp-admin/admin-ajax.php"
+
+
+def test_elementor_without_stated_ajaxurl_is_unclear_not_guessed() -> None:
+    for cfg in (None, 'var elementorFrontendConfig = {"environmentMode":{}};',
+                'var ElementorProFrontendConfig = {"nonce":"x"};'):
+        r = plan_for_html(elementor_html(cfg))
+        assert r.status == UNCLEAR and "AJAX address" in r.detail, cfg
+
+
+def test_elementor_ajaxurl_on_another_domain_is_unclear() -> None:
+    cfg = 'var ElementorProFrontendConfig = {"ajaxurl":"https:\\/\\/evil.example.com\\/wp-admin\\/admin-ajax.php"};'
+    r = plan_for_html(elementor_html(cfg))
+    assert r.status == UNCLEAR and "another domain" in r.detail
+
+
+def test_elementor_form_without_form_id_is_unclear() -> None:
+    html = (FIXTURES / "elementor.html").read_text(encoding="utf-8").replace(
+        '<input type="hidden" name="form_id" value="4f1a2b3">', "")
+    r = plan_for_html(html)
+    assert r.status == UNCLEAR and "form_id" in r.detail
+
+
+def test_non_elementor_form_keeps_html_handler() -> None:
+    r = plan_for("cf7_hebrew.html")
+    assert r.plan.handler == HTML_FORM
 
 
 def test_plain_english_form_and_search_form_excluded() -> None:

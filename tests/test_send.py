@@ -276,11 +276,11 @@ def test_exception_inside_verify_leaves_row_pending_and_run_continues(two, monke
     real_verify = send_mod.verify
     calls = []
 
-    def verify_fails_first(outcome, before_html):
+    def verify_fails_first(outcome, before_html, handler="html"):
         calls.append(1)
         if len(calls) == 1:
             raise ValueError("parser blew up on the response")
-        return real_verify(outcome, before_html)
+        return real_verify(outcome, before_html, handler)
 
     monkeypatch.setattr(send_mod, "verify", verify_fails_first)
     report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
@@ -657,3 +657,96 @@ def test_only_one_post_function_and_no_retry_wrapper() -> None:
     assert src.count('client.stream("POST"') == 1
     assert "retry" not in src.lower().replace("no retry", "").replace("never retried", "").replace(
         "not retried", "").replace("no automatic retry", "")
+
+
+# --- Elementor forms (sent to the AJAX address the page states, JSON reply) --
+
+ELEMENTOR_KEY = "elementor-site.co.il"
+ELEMENTOR_AJAX = "/wp-admin/admin-ajax.php"
+
+
+def prepare_elementor(project: Path, server: HTTPServer, reply):
+    from conftest import fixture_html
+    server.expect_request("/robots.txt").respond_with_data("User-agent: *\nAllow: /\n", content_type="text/plain")
+    server.expect_request("/", method="GET").respond_with_data(fixture_html("elementor.html"),
+                                                                content_type="text/html; charset=utf-8")
+    server.expect_request(ELEMENTOR_AJAX, method="POST").respond_with_handler(reply)
+    cfg = load_config(root=project, environ={"SENDER_ADDRESS": ADDRESS, "OUTREACH_HOST_DELAY_SECONDS": "0"})
+    led = Ledger(cfg.ledger_path)
+    led.create_batches([[{"site_key": ELEMENTOR_KEY, "domain": "127.0.0.1", "input_url": server.url_for("/")}]])
+    with Fetcher(delay_seconds=0) as f:
+        report = run_dry_run(cfg, led, "B0001", fetcher=f, out=lambda s: None)
+    assert [o.outcome for o in report.outcomes] == ["ready"], report.outcomes
+    approve_batch(led, "B0001", ask=lambda p: "B0001", out=lambda s: None)
+    server.clear_log()
+    return cfg, led
+
+
+def posts(server: HTTPServer) -> list[Request]:
+    return [r for r, _ in server.log if r.method == "POST"]
+
+
+def json_reply(body: str):
+    return lambda req: Response(body, content_type="application/json; charset=UTF-8")
+
+
+def test_elementor_form_is_posted_once_to_its_ajax_address(project: Path, httpserver: HTTPServer) -> None:
+    cfg, led = prepare_elementor(project, httpserver, json_reply('{"success":true,"data":{"message":"ok"}}'))
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert [s.result for s in report.sites] == [SENT]
+    sent = posts(httpserver)
+    assert len(sent) == 1 and sent[0].path == ELEMENTOR_AJAX     # never a POST to the page itself
+    req = sent[0]
+    assert req.mimetype == "multipart/form-data"
+    assert req.headers["X-Requested-With"] == "XMLHttpRequest"
+    form = req.form
+    assert form["action"] == "elementor_pro_forms_send_form"
+    assert form["referrer"] == httpserver.url_for("/")
+    assert form["post_id"] == "123" and form["form_id"] == "4f1a2b3"
+    assert form["form_fields[name]"] == cfg.sender_name and form["form_fields[email]"] == cfg.sender_email
+    assert form["form_fields[message]"] == render_message(cfg)
+    assert led.get(ELEMENTOR_KEY)["status"] == SENT
+    led.close()
+
+
+@pytest.mark.parametrize("body", [
+    '{"success":false,"data":{"message":"Your submission failed because of an error."}}',
+    "0",                                   # WordPress: no handler registered for this action
+    "<html><body>תודה</body></html>",      # an HTML page, even with a success word, is not Elementor's reply
+])
+def test_elementor_without_success_true_is_unconfirmed_and_never_resent(project: Path, httpserver: HTTPServer,
+                                                                        body: str) -> None:
+    cfg, led = prepare_elementor(project, httpserver, json_reply(body))
+    report = run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert [s.result for s in report.sites] == [SENT_UNCONFIRMED]
+    run_send(cfg, led, "B0001", environ=LIVE, **quiet())
+    assert len(posts(httpserver)) == 1
+    assert led.get(ELEMENTOR_KEY)["status"] == SENT_UNCONFIRMED
+    led.close()
+
+
+@pytest.mark.parametrize(("outcome", "status"), [
+    (PostOutcome(200, None, '{"success":true,"data":{}}'), SENT),
+    (PostOutcome(200, None, '{"success":"true"}'), SENT_UNCONFIRMED),
+    (PostOutcome(200, None, '{"success":false,"data":{"message":"x"}}'), SENT_UNCONFIRMED),
+    (PostOutcome(200, None, "[]"), SENT_UNCONFIRMED),
+    (PostOutcome(400, None, "0"), SENT_UNCONFIRMED),
+    (PostOutcome(302, "/thank-you", ""), SENT_UNCONFIRMED),
+    (PostOutcome(500, None, '{"success":true}'), SENT_UNCONFIRMED),
+    (PostOutcome(error="ReadTimeout"), SENT_UNCONFIRMED),
+])
+def test_verify_elementor_rules(outcome: PostOutcome, status: str) -> None:
+    assert verify(outcome, "<form>contact</form>", "elementor")[0] == status
+
+
+def test_plan_approved_before_the_elementor_change_is_not_sent() -> None:
+    from bs4 import BeautifulSoup
+    from conftest import fixture_html
+    from outreach.classify import build_plan
+    from outreach.finder import choose_form
+    page = "https://www.example.co.il/contact/"
+    fresh = build_plan(choose_form(BeautifulSoup(fixture_html("elementor.html"), "lxml"))[0], page).plan
+    old = fresh.to_dict()
+    del old["handler"]
+    old.update(action_url=page, encoding="application/x-www-form-urlencoded")
+    assert {"handler", "action_url", "encoding"} <= set(send_mod.plan_differences(fresh, old))
