@@ -133,6 +133,30 @@ def test_circuit_breaker_halts_after_consecutive_fetch_errors(project: Path) -> 
         assert led.get_batch("B0001")["state"] == "planned"
 
 
+def test_network_outage_trips_the_breaker_and_is_not_reported_as_robots_blocked(
+        project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replays the real outage: every host name fails to resolve. The run must stop, not mark sites blocked."""
+    import httpx
+    from outreach.fetch import Fetcher
+
+    def no_dns(self, request):
+        raise httpx.ConnectError("[Errno 11001] getaddrinfo failed", request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", no_dns)
+    cfg = load_config(root=project, environ={})          # default breaker threshold: 5
+    with Ledger(cfg.ledger_path) as led:
+        led.create_batches([[{"site_key": f"outage{i}.co.il", "domain": f"outage{i}.co.il",
+                              "input_url": f"https://outage{i}.co.il/"} for i in range(25)]])
+        with Fetcher(delay_seconds=0) as f:
+            report = run_dry_run(cfg, led, "B0001", fetcher=f, out=lambda s: None)
+        results = led.dry_run_results("B0001")
+        assert not report.completed
+        assert "circuit breaker" in report.halted_reason and "getaddrinfo failed" in report.halted_reason
+        assert len(results) == 5                                   # stopped after 5, not 25 wrong results
+        assert {r["outcome"] for r in results} == {"fetch_error"}  # never robots_blocked
+        assert led.get_batch("B0001")["state"] == "planned"        # cannot be approved from bad data
+
+
 def test_suppressed_and_handled_sites_are_not_fetched(env) -> None:
     cfg, led = env
     led.add_suppression("domain", "b-example.co.il", reason="asked")

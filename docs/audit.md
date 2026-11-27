@@ -130,8 +130,8 @@ The current code is `src/outreach/fetch.py`, `_fetch_robots`, from line 278. It 
 | 401 / 403 / other 4xx | allowed | `test_robots_401_403_mean_allow_and_page_is_fetched[401]`, `[403]`, `test_robots_status_handling[400-True]` |
 | 429 | **disallow** (owner's decision) | `test_robots_429_means_disallow_and_page_is_not_requested`, `test_robots_status_handling[429-False]` |
 | 5xx | disallow | `test_robots_status_handling[500-False]`, `[502-False]`, `[503-False]` |
-| Network error (unreachable) | disallow | `test_robots_network_error_means_disallow` |
-| Timeout | disallow | `test_robots_timeout_means_disallow` |
+| Network error (unreachable, DNS failure) | page not requested; reported as **fetch_error** (counts for the circuit breaker) | `test_robots_network_error_means_disallow`, `test_dns_failure_is_a_fetch_error_not_robots_blocked` |
+| Timeout | page not requested; reported as **fetch_error** | `test_robots_timeout_means_disallow` |
 | Redirect, also to another host | followed (up to 3 hops) | `test_robots_redirect_to_another_host_is_followed` |
 | More than 3 redirects | treated as missing: allowed | `test_robots_too_many_redirects_is_treated_as_missing` |
 | Body over 2 MB | parsed up to 2 MB | `test_oversized_robots_is_parsed_up_to_the_cap` |

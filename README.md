@@ -124,7 +124,7 @@ Settings come from environment variables or from `.env` in the project folder. A
 - **Only static HTML is read.** Sites that build their contact form with JavaScript are recorded as `no_form`. There is no browser automation.
 - **No CAPTCHA, login or paywall handling**, by design. Those sites are recorded and skipped.
 - **Success detection is rule-based.** It looks for a success phrase that was not already on the form page, or a redirect to a thank-you/success URL. Everything else is `sent_unconfirmed`, which is never re-sent even if the message did arrive.
-- **robots.txt:** a missing file (404/410) or 401/403 means allowed; a network error, a 5xx answer or 429 means the whole site is skipped for this run.
+- **robots.txt:** a missing file (404/410) or 401/403 means allowed; a 5xx answer or 429 means the site is skipped as `robots_blocked`. A network failure (no internet, DNS, timeout) is reported as `fetch_error` and, after `OUTREACH_BREAKER_THRESHOLD` failures in a row, stops the run so an outage cannot produce a batch of wrong results. Re-run the dry-run when the connection is back.
 - **Platform URLs** (facebook.com/x, instagram.com/x, ...) normally have no usable form and robots.txt usually blocks them.
 - **One site key per registrable domain.** A business with two domains (e.g. `example.co.il` and `example.com`) counts as two sites.
 - **Legal questions are unresolved.** The message text is pending legal review (docs/message-template.md). Live sending must stay disabled until the owner confirms the lawyer has answered.

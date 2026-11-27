@@ -128,7 +128,8 @@ def run_dry_run(config: Config, ledger: Ledger, batch_id: str, *, fetcher: Fetch
             if so.outcome == FETCH_ERROR:
                 if breaker.record_failure():
                     report.halted_reason = (f"circuit breaker tripped after {breaker.consecutive_failures} "
-                                            f"consecutive fetch errors")
+                                            f"consecutive fetch errors (last: {so.detail}). If these are network "
+                                            "errors, check the internet connection and run the dry-run again")
                     break
             else:
                 breaker.record_success()

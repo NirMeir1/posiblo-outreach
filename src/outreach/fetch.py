@@ -5,6 +5,8 @@
   disallowed URL is never requested and yields `robots_blocked`.
   robots.txt means "disallow everything" only on a network error, a 5xx
   answer or 429; any other 4xx (404/410 missing, 401/403, ...) means "allowed".
+  A network error is reported as `fetch_error` (not `robots_blocked`): the
+  site did not refuse anything, and the circuit breaker must see outages.
 - Minimum delay between two requests to the same host (from config).
 - Sequential: one request at a time per Fetcher (a lock), no concurrency.
 - 15 s timeout, body capped at 2 MB (declared or streamed), at most 3
@@ -81,6 +83,7 @@ class _RobotsPolicy:
     disallow_all: bool = False
     parser: robotparser.RobotFileParser | None = None
     detail: str = ""
+    network_error: bool = False  # robots.txt could not be fetched at all (DNS, connection, timeout)
 
     def allows(self, url: str) -> bool:
         if self.disallow_all:
@@ -205,6 +208,11 @@ class Fetcher:
                                    redirects=redirects)
             policy = self._robots_policy(current)
             if not policy.allows(current):
+                if policy.network_error:
+                    # Not a refusal by the site: the network failed. The page is still not requested,
+                    # but it is reported as a fetch error so it counts for the circuit breaker.
+                    return FetchResult(url, current, FETCH_ERROR, redirects=redirects,
+                                       detail=f"network error, page not requested: {policy.detail}")
                 return FetchResult(url, current, ROBOTS_BLOCKED, redirects=redirects,
                                    detail=f"robots.txt does not allow {current}" + (f" ({policy.detail})"
                                                                                     if policy.detail else ""))
@@ -292,7 +300,7 @@ class Fetcher:
             try:
                 raw = self._request(current, truncate=True)
             except _RequestFailed as e:
-                return _RobotsPolicy(disallow_all=True, detail=f"robots.txt not reachable: {e}")
+                return _RobotsPolicy(disallow_all=True, network_error=True, detail=f"robots.txt not reachable: {e}")
             if raw.status in _REDIRECT_CODES and raw.headers.get("location"):
                 current = urljoin(current, raw.headers["location"])
                 continue

@@ -198,14 +198,15 @@ def test_server_error_is_not_retried(httpserver: HTTPServer, fetcher: Fetcher) -
 
 
 def test_robots_network_error_means_disallow(fetcher: Fetcher) -> None:
-    """robots.txt cannot be reached at all (connection refused): disallow, and the page is not requested."""
+    """robots.txt cannot be reached at all (connection refused): the page is not requested, and the
+    outcome is a network fetch_error (not robots_blocked: the site did not refuse anything)."""
     import socket
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens here now
     r = fetcher.get(f"http://127.0.0.1:{port}/")
-    assert r.outcome == ROBOTS_BLOCKED and "not reachable" in r.detail
+    assert r.outcome == FETCH_ERROR and "network error" in r.detail and "not reachable" in r.detail
     assert fetcher.requested == [f"http://127.0.0.1:{port}/robots.txt"]
 
 
@@ -218,9 +219,29 @@ def test_robots_timeout_means_disallow(httpserver: HTTPServer) -> None:
     httpserver.expect_request("/").respond_with_data("page", content_type="text/html")
     with Fetcher(delay_seconds=0, timeout=0.5) as f:
         r = f.get(httpserver.url_for("/"))
-    assert r.outcome == ROBOTS_BLOCKED and "timeout" in r.detail
+    assert r.outcome == FETCH_ERROR and "timeout" in r.detail and "network error" in r.detail
     time.sleep(1.2)
     assert paths(httpserver) == ["/robots.txt"]
+
+
+def test_dns_failure_is_a_fetch_error_not_robots_blocked(fetcher: Fetcher, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What happened during the real outage: the host name could not be resolved."""
+    import httpx
+
+    def no_dns(self, request):
+        raise httpx.ConnectError("[Errno 11001] getaddrinfo failed", request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", no_dns)
+    r = fetcher.get("https://outage-example.co.il/")
+    assert r.outcome == FETCH_ERROR and "getaddrinfo failed" in r.detail
+    assert fetcher.requested == ["https://outage-example.co.il/robots.txt"]   # the page itself was never tried
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_real_robots_refusals_stay_robots_blocked(httpserver: HTTPServer, fetcher: Fetcher, status: int) -> None:
+    robots(httpserver, "no", status=status)
+    httpserver.expect_request("/").respond_with_data("ok", content_type="text/html")
+    assert fetcher.get(httpserver.url_for("/")).outcome == ROBOTS_BLOCKED
 
 
 def test_robots_404_means_allow_and_page_is_fetched(httpserver: HTTPServer, fetcher: Fetcher) -> None:

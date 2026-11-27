@@ -1729,6 +1729,9 @@ APPROVED_CHANGES = {
     "suppression with platform keys": ["tests/test_ledger.py::test_suppression_with_platform_aware_keys",
                                        "tests/test_ledger.py::test_a_bare_platform_can_never_be_suppressed",
                                        "tests/test_send.py::test_suppressed_platform_account_is_not_sent"],
+    "outage handling": ["tests/test_fetch.py::test_dns_failure_is_a_fetch_error_not_robots_blocked",
+                        "tests/test_fetch.py::test_real_robots_refusals_stay_robots_blocked[",
+                        "tests/test_dryrun.py::test_network_outage_trips_the_breaker_and_is_not_reported_as_robots_blocked"],
     "pinned dependencies": ["tests/test_dependencies.py::test_every_direct_dependency_is_an_exact_pin_matching_the_lock",
                             "tests/test_dependencies.py::test_tldextract_is_pinned_and_installed_at_the_pinned_version"],
 }

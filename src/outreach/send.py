@@ -310,7 +310,7 @@ class _Run:
             if r.result in (SENT_UNCONFIRMED, "fetch_error", ERROR):
                 if breaker.record_failure():
                     report.halted_reason = (f"circuit breaker tripped after {breaker.consecutive_failures} "
-                                            "consecutive failures")
+                                            f"consecutive failures (last: {r.detail})")
                     break
             elif r.result == SENT:
                 breaker.record_success()
